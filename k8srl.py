@@ -53,8 +53,8 @@ BOOT_TIME = 5      # Seconds it takes the tank truck to arrive
 SIM_TIME = 110000000            # Simulation time in seconds
 NUM_ARRIVALS = 10000
 CONTROL_TIME_INTERVAL = 30.0
-NUMBER_OF_HOSTS = 10
-NUMBER_OF_SERVERS = 5
+NUMBER_OF_NODES = 10
+NUMBER_OF_PODS = 5
 ARRIVAL_RATE = 20.
 SERVICE_RATE = 2.0
 SERVICE_TIME = 1.2
@@ -112,9 +112,11 @@ class Action(IntEnum):
 
 class PowerState(IntEnum):
     OFF = 0
-    ON_A = 1  # ON and accept customers
-    ON_N = 2  # ON and does not accept customers
+    ON = 1
+    IDLE = 2
 
+#hostokbol lettek a node-ok
+#serverekbol lettek a podok
 
 class Cluster(object):
     """A queue has a limited number of servers (``NUM_SERVERS``) to
@@ -124,43 +126,41 @@ class Cluster(object):
     can start the serving processes and wait for it to finish (which
     takes ``washtime`` minutes).
     """
-    def __init__(self, env: Any, number_of_hosts: int,
+    def __init__(self, env: Any, NUMBER_OF_NODES: int,
                  number_of_servers: int) -> None:
         self.env = env
-        self.number_of_hosts = number_of_hosts
-        self.number_of_servers = number_of_servers
-        self.hosts = {i: simpy.Resource(self.env, self.number_of_servers)
+        self.number_of_nodes = NUMBER_OF_NODES
+        self.number_of_pods = NUMBER_OF_PODS
+        self.nodes = {i: simpy.Resource(self.env, self.number_of_nodes)
                       for i in range(self.number_of_hosts)}
-        #  self.host_state = {i: 0 for i in range(self.number_of_hosts)}
-        self.host_state = np.array([0 for _ in range(self.number_of_hosts)])
-        self.host_state[0] = PowerState.ON_A
-        #  1: on, 0: off, 3: on -- do not allocate
-        self.digest = TDigest()
-        #  response time
-        self.arrdigest = TDigest()
-        #  arrival time
-        self.active_num = 1
+
+        self.node_state = np.array([0 for _ in range(self.number_of_hosts)])
+        self.node_state[0] = PowerState.ON
+
+        self.digest = TDigest()     #  response time
+        self.arrdigest = TDigest()  #  arrival time
         self.arrdigest.update(100.)
         self.digest.update(0.)
 
+        self.active_nodes = 1
+
         # self.buffer=self.env.Store()
     def search_for_allocation(self) -> Any:
-        ihostwith_smallest = self.number_of_hosts-1
-        for j in range(self.number_of_hosts):
-            if self.host_state[j] == PowerState.ON_A:
-                ihostwith_smallest = j
+        lowest_load_node = self.number_of_nodes - 1
+        for j in range(self.number_of_nodes):
+            if self.node_state[j] == PowerState.ON:
+                lowest_load_node = j
                 break
-        for i in range(j+1, self.number_of_hosts):
-            if (self.host_state[i] == PowerState.ON_A and
-                    len(self.hosts[i].queue) + self.hosts[i].count <
-                    len(self.hosts[ihostwith_smallest].queue) +
-                    self.hosts[ihostwith_smallest].count):
-                ihostwith_smallest = i
-        #  print(self.number_of_hosts)
-        assert ihostwith_smallest < self.number_of_hosts, \
-            (f"number small than {self.number_of_hosts} "
-             f"expected, got: {ihostwith_smallest}")
-        return ihostwith_smallest
+        for i in range(j + 1, self.number_of_nodes):
+            if (self.node_state[i] == PowerState.ON and
+                    len(self.nodes[i].queue) + self.nodes[i].count <
+                    len(self.nodes[lowest_load_node].queue) +
+                    self.hosts[lowest_load_node].count):
+                lowest_load_node = i
+
+        assert lowest_load_node < self.number_of_hosts, \
+            (f"node idx must be smaller than total number of nodes: {self.number_of_nodes} "f"expected, got: {lowest_load_node}")
+        return lowest_load_node
 
     def search_for_off_host(self) -> Any:
         hostid = self.number_of_hosts
@@ -175,6 +175,11 @@ class Cluster(object):
                     hostid = i
                     break
         return hostid
+
+    def scaleOut(self) -> Any:
+        node_id = self.search_for_off_node()
+        self.node_state[node_id] = ON
+
 
 
 def customer(name, env, cluster):
@@ -237,7 +242,7 @@ class ClusterEnv(ExternalEnv):
     def __init__(self, config: EnvContext):
 
         self.number_of_hosts = config["number_of_hosts"]
-        self.num_servers = config["num_servers"]
+        self.num_of_pods = config["num_of_pods"]
         self.percentile_points = config["percentile_points"]
         self.number_of_active_hosts = 1
         self.observation_space = Tuple(
