@@ -44,17 +44,23 @@ import simpy
 import random
 
 from tdigest import TDigest
-from enum import IntEnum
+from enum import IntEnum, Enum
+from collections import namedtuple
 import itertools
 
 RANDOM_SEED = 42
 
-BOOT_TIME = 5      # Seconds it takes the tank truck to arrive
+BOOT_TIME_NODE = 5
+BOOT_TIME_POD = 1
 SIM_TIME = 110000000            # Simulation time in seconds
 NUM_ARRIVALS = 10000
 CONTROL_TIME_INTERVAL = 30.0
+
 NUMBER_OF_NODES = 10
 NUMBER_OF_PODS = 5
+NODE_RAM = 16000
+NODE_CORE = 8
+
 ARRIVAL_RATE = 20.
 SERVICE_RATE = 2.0
 SERVICE_TIME = 1.2
@@ -109,7 +115,6 @@ class Action(IntEnum):
     Do_nothing = 1
     ScaleIn = 2
 
-
 class PowerState(IntEnum):
     OFF = 0
     ON = 1
@@ -117,6 +122,32 @@ class PowerState(IntEnum):
 
 #hostokbol lettek a node-ok
 #serverekbol lettek a podok
+
+Resources = namedtuple("Resources", ["ram", "cpu"])
+
+class ServiceType(Enum):
+    typeA = Resources(ram = 128, cpu = 0.1)
+    typeB = Resources(ram = 256, cpu = 0.2)
+    typeC = Resources(ram = 512, cpu = 0.4)
+
+class Pod(object):
+    def __init__(self, env: Any, service_type: ServiceType , power_state: PowerState) -> None:
+        self.env = env
+        self.service_type = service_type
+
+        self.power_state = power_state
+        self.ram = simpy.Resource(self.env, service_type.value.ram)
+        self.cpu = simpy.Resource(self.env, service_type.value.cpu)
+
+class Node(object):
+    def __init__(self, env: Any, node_id: int, power_state: PowerState) -> None:
+        self.env = env
+
+        self.power_state = power_state
+        self.ram = simpy.Resource(self.env, NODE_RAM)
+        self.cpu = simpy.Resource(self.env, NODE_CORE)
+
+        self.pods = []
 
 class Cluster(object):
     """A queue has a limited number of servers (``NUM_SERVERS``) to
@@ -126,15 +157,15 @@ class Cluster(object):
     can start the serving processes and wait for it to finish (which
     takes ``washtime`` minutes).
     """
-    def __init__(self, env: Any, NUMBER_OF_NODES: int,
-                 number_of_servers: int) -> None:
+    def __init__(self, env: Any, number_of_nodes: int, number_of_pods: int) -> None:
         self.env = env
         self.number_of_nodes = NUMBER_OF_NODES
         self.number_of_pods = NUMBER_OF_PODS
-        self.nodes = {i: simpy.Resource(self.env, self.number_of_nodes)
-                      for i in range(self.number_of_hosts)}
 
-        self.node_state = np.array([0 for _ in range(self.number_of_hosts)])
+        self.nodes = [Node(env, node_id=i, PowerState.ON) for i in range(NUMBER_OF_NODES)]
+
+
+        self.node_state = np.array([0 for _ in range(self.number_of_nodes)])
         self.node_state[0] = PowerState.ON
 
         self.digest = TDigest()     #  response time
@@ -162,24 +193,35 @@ class Cluster(object):
             (f"node idx must be smaller than total number of nodes: {self.number_of_nodes} "f"expected, got: {lowest_load_node}")
         return lowest_load_node
 
-    def search_for_off_host(self) -> Any:
-        hostid = self.number_of_hosts
-        for j in range(self.number_of_hosts):
-            if self.host_state[j] == PowerState.ON_N:
-                hostid = j
-                #  print("Terminate the switch off")
+    def idle_node_search(self) -> Any:
+        node_id = self.number_of_nodes
+        for j in range(self.number_of_nodes):
+            if self.node_state[j] == PowerState.IDLE:
+                node_id = j
                 break
-        if hostid == self.number_of_hosts:
-            for i in range(self.number_of_hosts):
-                if self.host_state[i] == PowerState.OFF:
-                    hostid = i
+        if (node_id == self.number_of_nodes):
+            for i in range(self.number_of_nodes):
+                if (self.node_state[i] == PowerState.OFF):
+                    node_id = i
                     break
-        return hostid
+        return node_id
+
+    def least_pods_node_search(self) -> Any:
+        for i in range(self.number_of_nodes):
+            if (self.node)
+
 
     def scaleOut(self) -> Any:
-        node_id = self.search_for_off_node()
-        self.node_state[node_id] = ON
+        node_id = self.search_for_node()
 
+        if (node_id < self.cluster.number_of_nodes):
+            if (self.cluster.node_state[node_id] == PowerState.OFF):
+                yield self.k8env.process( start_node(self.k8env, self.cluster, node_id) )
+            else:
+                self.cluster.node_state[node_id] = PowerState.ON
+
+    def scaleIn(self) -> Any:
+        node_id = self.least_pods_node_search()
 
 
 def customer(name, env, cluster):
@@ -214,12 +256,16 @@ def customer(name, env, cluster):
         #  env.now - start,t))
 
 
-def start_host(env, cluster, hostid):
-    yield env.timeout(BOOT_TIME)
-    #  print('Host %d ready at time %d' % (hostid,env.now))
-    #  print('No of active hosts %d' % cluster.active_num)
-    cluster.host_state[hostid] = PowerState.ON_A
+def start_node(env, cluster, node_id):
+    yield env.timeout(BOOT_TIME_NODE)
+    cluster.node_state[node_id] = PowerState.ON
     cluster.active_num += 1
+
+def start_pod(env, cluster, node_id, service_type):
+    yield env.timeout(BOOT_TIME_POD)
+    cluster.nodes[node_id].pods.append(Pod(env, service_type, PowerState.ON))
+
+def terminate_pod(env, cluster, )
 
 
 def customer_generator(env, cluster):
@@ -273,8 +319,8 @@ class ClusterEnv(ExternalEnv):
             "observation_space": self.observation_space,
         }
         ExternalEnv.__init__(self, self.action_space, self.observation_space)
-        self.simenv = simpy.Environment()
-        self.cluster = Cluster(self.simenv, self.number_of_hosts,
+        self.k8env = simpy.Environment()
+        self.cluster = Cluster(self.k8env, self.number_of_hosts,
                                self.num_servers)
         self.nc = 0
         self.arr = np.zeros(shape=(self.percentile_points,))
@@ -292,7 +338,7 @@ class ClusterEnv(ExternalEnv):
     def cluster_control(self):
         #  Periodically manages the cluster"""
         #  print("cluster control ---")
-        yield self.simenv.timeout(CONTROL_TIME_INTERVAL)
+        yield self.k8env.timeout(CONTROL_TIME_INTERVAL)
         for i in range(self.percentile_points):
             self.arr[i] = self.cluster.arrdigest.percentile(i)
             self.ser[i] = self.cluster.digest.percentile(i)
@@ -305,7 +351,7 @@ class ClusterEnv(ExternalEnv):
         while True:
             #  perform acion
             if(self.nc % 100 == 0) :
-               print("cluster control ", self.nc, "time", self.simenv.now)
+               print("cluster control ", self.nc, "time", self.k8env.now)
             self.nc +=1
             self.eid = self.start_episode()
             #  print(self.eid)
@@ -328,7 +374,7 @@ class ClusterEnv(ExternalEnv):
                 #  print("scale out, host %d" %hostid)
                 if hostid < self.cluster.number_of_hosts:
                     if self.cluster.host_state[hostid] == PowerState.OFF:
-                        yield self.simenv.process(start_host(self.simenv,
+                        yield self.k8env.process(start_host(self.k8env,
                             self.cluster, hostid))
                     else:
                         self.cluster.host_state[hostid] = PowerState.ON_A
@@ -349,7 +395,7 @@ class ClusterEnv(ExternalEnv):
             del self.cluster.arrdigest
             self.cluster.arrdigest = TDigest()
 
-            yield self.simenv.timeout(CONTROL_TIME_INTERVAL)
+            yield self.k8env.timeout(CONTROL_TIME_INTERVAL)
 
             for i in range(self.percentile_points):
                 self.arr[i] = self.cluster.arrdigest.percentile(i)
@@ -387,17 +433,11 @@ class ClusterEnv(ExternalEnv):
             #  construct observation
 
     def run(self):
-        #  print("Start -------")
-        #  random.seed(RANDOM_SEED)
-        #  np.array([(len(self.cluster.hosts[i].queue)+self.cluster.hosts[i].count
-        #  for i in range(self.cluster.number_of_hosts))])
-        #  self.hoststate=    numpy.array([self.cluster.host_state[i]
-        #  for i in range(self.cluster.number_of_hosts)])
-        self.simenv.process(self.cluster_control())
-        self.simenv.process(customer_generator(self.simenv, self.cluster))
-        print("Start sim...")
-        self.simenv.run(until=SIM_TIME)
-        print("sim vege...")
+        self.k8env.process(self.cluster_control())
+        self.k8env.process(customer_generator(self.k8env, self.cluster))
+        print("--Starting simulation--")
+        self.k8env.run(until=SIM_TIME)
+        print("--Simulation ended--")
 
 def env_creator(env_config):
      return ClusterEnv(env_config)
@@ -412,18 +452,13 @@ if __name__ == "__main__":
 
     ray.init(local_mode=args.local_mode,num_gpus=1)
 
-    # Can also register the env creator function explicitly with:
-    # register_env("corridor", lambda config: SimpleCorridor(config={
-    #    "number_of_hosts": NUMBER_OF_HOSTS, "num_servers": NUMBER_OF_SERVERS, "percentile_points": 100}))
-    
-    #  register_env("cluster-env-v01", env_creator)
-    register_env("cluster-env-v01", lambda _: ClusterEnv(config={
-     "number_of_hosts": NUMBER_OF_HOSTS, "num_servers": NUMBER_OF_SERVERS, "percentile_points": 100}))
+    register_env("k8-env", lambda _: ClusterEnv(config={
+     "number_of_nodes": NUMBER_OF_NODES, "num_servers": NUMBER_OF_PODS, "percentile_points": 100}))
 
 
     config = (
             DQNConfig()
-            .environment("cluster-env-v01")
+            .environment("k8-env")
             .rollouts(num_rollout_workers=1, enable_connectors=False)
     )
     dqn = config.build()
