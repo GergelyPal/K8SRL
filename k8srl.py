@@ -150,14 +150,37 @@ class Node(object):
 
         self.pods = []
 
-class Cluster(object):
-    """A queue has a limited number of servers (``NUM_SERVERS``) to
-    serve customers in parallel.
+    def search_for_pod(self, service_type):
+        pod_id = len(self.pods) - 1
+        pod_found = False
+        for pod in self.pods:
+            if(pod.service_type == service_type):
+                pod_id = pod.pod_id
+                pod_found = True
+                break
 
-    customers have to request one of the servers. When they got one, they
-    can start the serving processes and wait for it to finish (which
-    takes ``washtime`` minutes).
-    """
+        if (not pod_found):
+            return -1
+        for pod in self.pods:
+            if(pod.service_type == service_type and pod.ram > self.pods[pod_id].ram):
+                pod_id = pod.pod_id
+        return pod_id
+
+
+    def desiredReplicas(self, desired_usage):
+        avr_usage = 0
+        for pod in self.pods:
+            used_ram = pod.ram.capacity - pod.ram.level
+            ram_usage = used_ram / pod.ram.capacity * 100
+            avr_usage += ram_usage
+
+        avr_usage = avr_usage / len(self.pods)
+        x = len(self.pods) * (avr_usage / desired_usage)
+        return math.ceil(x)
+
+
+
+class Cluster(object):
     def __init__(self, env: Any, number_of_nodes: int, number_of_pods: int) -> None:
         self.env = env
         self.number_of_nodes = NUMBER_OF_NODES
@@ -167,7 +190,6 @@ class Cluster(object):
 
 
         self.node_state = np.array([0 for _ in range(self.number_of_nodes)])
-        self.node_state[0] = PowerState.ON
 
         self.digest = TDigest()     #  response time
         self.arrdigest = TDigest()  #  arrival time
@@ -176,12 +198,11 @@ class Cluster(object):
 
         self.active_nodes = 1
 
-        # self.buffer=self.env.Store()
-    def search_for_allocation(self) -> Any:
+    def search_for_node(self) -> Any:
         lowest_load_node = self.number_of_nodes - 1
-        for j in range(self.number_of_nodes):
-            if self.node_state[j] == PowerState.ON:
-                lowest_load_node = j
+        for node in range(self.number_of_nodes):
+            if self.nodes[node].power_state == PowerState.ON:
+                lowest_load_node = node
                 break
         for i in range(j + 1, self.number_of_nodes):
             if (self.node_state[i] == PowerState.ON and
@@ -207,54 +228,49 @@ class Cluster(object):
                     break
         return node_id
 
-    def least_pods_node_search(self) -> Any:
-        for i in range(self.number_of_nodes):
-            if (self.node)
-
 
     def scaleOut(self) -> Any:
-        node_id = self.search_for_node()
+        node_id = self.idle_node_search()
 
         if (node_id < self.cluster.number_of_nodes):
-            if (self.cluster.node_state[node_id] == PowerState.OFF):
+            if (self.cluster.nodes[node_id].power_state == PowerState.OFF):
                 yield self.k8env.process( start_node(self.k8env, self.cluster, node_id) )
             else:
-                self.cluster.node_state[node_id] = PowerState.ON
+                self.cluster.nodes[node_id].power_state = PowerState.ON
 
-    def scaleIn(self) -> Any:
+
+    def scaleIn(self, env, cluster) -> Any:
         node_id = self.least_pods_node_search()
+        scale_in_node(env, cluster, node_id)
 
 
-def customer(name, env, cluster):
-    """A customer arrives at the cluster for service.
-    It requests one of the servers. If there is no server available,
-    the customer has to wait for a new server (takes time to boot a host.
-    """
-    #  print('No of active hosts %d' % cluster.active_num)
-    #  print('%s arriving at cluster at %.1f' % (name, env.now))
-    assignedto = cluster.search_for_allocation()
-    #  print("Host %d queue size: %d " %
-    #  (assignedto,len(cluster.hosts[assignedto].queue)))
-    #  print("Being served:", cluster.hosts[assignedto].count)
-    with cluster.hosts[assignedto].request() as req:
-        start = env.now
-        #  Request one of the servers from hosts[idh]
-        yield req
-        #  The "actual" service process takes some time
-        t = random.expovariate(SERVICE_RATE)
-        #  t=random.uniform(0.01,2)
-        #  t=1
-        yield env.timeout(t)
-        #print('customer departsZZ')
-        if (cluster.hosts[assignedto].count == 0 and
-                cluster.host_state[assignedto] == PowerState.ON_N):
-            cluster.host_state[assignedto] = PowerState.OFF
-            cluster.active_num -= 1
-        cluster.digest.update(env.now - start)
-        #  print('No of active hosts %d' % cluster.active_num)
-        #  print('%s finished service in %.7f seconds.
-        #  service time %.7f' % (name,
-        #  env.now - start,t))
+def task(env, cluster, service_type):
+    task_node_id = cluster.search_for_node()
+    task_pod_id = cluster.nodes[task_node_id].search_for_pod(service_type)
+
+    if(task_pod_id == -1):
+        new_pod(env, cluster, task_node_id, PowerState.ON)
+        task_pod_id = len(cluster.nodes[task_node_id].pods) - 1
+
+    cluster.nodes[task_node_id].pods[task_pod_id].ram.get(service_type.value.ram)
+    cluster.nodes[task_node_id].pods[task_pod_id].cpu.get(service_type.value.cpu)
+
+    start = env.now
+    yield req
+    t = random.expovariate(SERVICE_RATE) #??????????????
+    #  t=random.uniform(0.01,2)
+    #  t=1
+
+    yield env.timeout(t)
+    cluster.nodes[task_node_id].pods[task_pod_id].ram.put(service_type.value.ram)
+    cluster.nodes[task_node_id].pods[task_pod_id].cpu.put(service_type.value.cpu)
+#     if (cluster.nodes[task_node].count == 0 and
+#             cluster.nodes[task_node].power_state == PowerState.IDLE):
+#         cluster.nodes[task_node].power_state = PowerState.OFF
+
+    cluster.active_num -= 1 #???????
+    cluster.digest.update(env.now - start)
+
 
 
 def start_node(env, cluster, node_id):
@@ -262,10 +278,16 @@ def start_node(env, cluster, node_id):
     cluster.node_state[node_id] = PowerState.ON
     cluster.active_num += 1
 
-def start_pod(env, cluster, node_id, service_type):
+def scale_in_node(env, cluster, node_id):
+    cluster.node_state[node_id] = PowerState.IDLE
+    cluster.active_num -= 1
+
+    scale_in_pods() #TODO
+
+def new_pod(env, cluster, node_id, service_type, power_state):
     yield env.timeout(BOOT_TIME_POD)
 
-    new_pod = Pod(env, service_type, PowerState.ON)
+    new_pod = Pod(env, service_type, power_state)
     new_pod.pod_id = len(cluster.nodes[node_id].pods)
     cluster.nodes[node_id].pods.append(new_pod)
 
@@ -273,8 +295,6 @@ def start_pod(env, cluster, node_id, service_type):
     yield cluster.nodes[node_id].cpu.get(service_type.value.cpu)
 
 def terminate_pod(env, cluster, node_id, pod_id, service_type):
-    #eloszor vegezze el a folyamatait es csak utana kapcsoljon ki
-
     cluster.nodes[node_id].pods.pop(pop_id)
     yield cluster.nodes[node_id].ram.put(service_type.value.ram)
     yield cluster.nodes[node_id].cpu.put(service_type.value.cpu)
