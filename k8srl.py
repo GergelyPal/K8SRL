@@ -131,21 +131,22 @@ class ServiceType(Enum):
     typeC = Resources(ram = 512, cpu = 0.4)
 
 class Pod(object):
-    def __init__(self, env: Any, service_type: ServiceType , power_state: PowerState) -> None:
+    def __init__(self, env: Any, pod_id: int, service_type: ServiceType , power_state: PowerState) -> None:
         self.env = env
+        self.pod_id = pod_id
         self.service_type = service_type
 
         self.power_state = power_state
-        self.ram = simpy.Resource(self.env, service_type.value.ram)
-        self.cpu = simpy.Resource(self.env, service_type.value.cpu)
+        self.ram = simpy.Container(self.env, service_type.value.ram, service_type.value.ram)
+        self.cpu = simpy.Container(self.env, service_type.value.cpu, service_type.value.cpu)
 
 class Node(object):
     def __init__(self, env: Any, node_id: int, power_state: PowerState) -> None:
         self.env = env
 
         self.power_state = power_state
-        self.ram = simpy.Resource(self.env, NODE_RAM)
-        self.cpu = simpy.Resource(self.env, NODE_CORE)
+        self.ram = simpy.Container(self.env, NODE_RAM, NODE_RAM)
+        self.cpu = simpy.Container(self.env, NODE_CORE, NODE_RAM)
 
         self.pods = []
 
@@ -263,9 +264,21 @@ def start_node(env, cluster, node_id):
 
 def start_pod(env, cluster, node_id, service_type):
     yield env.timeout(BOOT_TIME_POD)
-    cluster.nodes[node_id].pods.append(Pod(env, service_type, PowerState.ON))
 
-def terminate_pod(env, cluster, )
+    new_pod = Pod(env, service_type, PowerState.ON)
+    new_pod.pod_id = len(cluster.nodes[node_id].pods)
+    cluster.nodes[node_id].pods.append(new_pod)
+
+    yield cluster.nodes[node_id].ram.get(service_type.value.ram)
+    yield cluster.nodes[node_id].cpu.get(service_type.value.cpu)
+
+def terminate_pod(env, cluster, node_id, pod_id, service_type):
+    #eloszor vegezze el a folyamatait es csak utana kapcsoljon ki
+
+    cluster.nodes[node_id].pods.pop(pop_id)
+    yield cluster.nodes[node_id].ram.put(service_type.value.ram)
+    yield cluster.nodes[node_id].cpu.put(service_type.value.cpu)
+
 
 
 def customer_generator(env, cluster):
