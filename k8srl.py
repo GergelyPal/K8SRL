@@ -60,6 +60,7 @@ NUMBER_OF_NODES = 10
 NUMBER_OF_PODS = 5
 NODE_RAM = 16000
 NODE_CORE = 8
+POD_USAGE = 90
 
 ARRIVAL_RATE = 20.
 SERVICE_RATE = 2.0
@@ -140,15 +141,19 @@ class Pod(object):
         self.ram = simpy.Container(self.env, service_type.value.ram, service_type.value.ram)
         self.cpu = simpy.Container(self.env, service_type.value.cpu, service_type.value.cpu)
 
+        self.num_tasks = 0
+
 class Node(object):
     def __init__(self, env: Any, node_id: int, power_state: PowerState) -> None:
         self.env = env
+        self.node_id = node_id
 
         self.power_state = power_state
         self.ram = simpy.Container(self.env, NODE_RAM, NODE_RAM)
         self.cpu = simpy.Container(self.env, NODE_CORE, NODE_RAM)
 
         self.pods = []
+        self.num_tasks = 0
 
     def search_for_pod(self, service_type):
         pod_id = len(self.pods) - 1
@@ -167,7 +172,7 @@ class Node(object):
         return pod_id
 
 
-    def desiredReplicas(self, desired_usage):
+    def desired_replicas(self, desired_usage):
         avr_usage = 0
         for pod in self.pods:
             used_ram = pod.ram.capacity - pod.ram.level
@@ -178,15 +183,28 @@ class Node(object):
         x = len(self.pods) * (avr_usage / desired_usage)
         return math.ceil(x)
 
+    def idle_pod_search(self) -> Any:       #return priority IDLE > ON
+        pod_id = len(self.pods)
+        for pod in self.pods:
+            if pod.power_state == PowerState.IDLE:
+                pod_id = pod.pod_id
+                break
+        if (pod_id == len(self.pods)):
+            for pod in self.pods:
+                if (pod.power_state == PowerState.ON):
+                    pod_id = pod.pod_id
+                    break
+        return pod_id
+
 
 
 class Cluster(object):
-    def __init__(self, env: Any, number_of_nodes: int, number_of_pods: int) -> None:
+    def __init__(self, env: Any, number_of_nodes: int,) -> None:
         self.env = env
         self.number_of_nodes = NUMBER_OF_NODES
         self.number_of_pods = NUMBER_OF_PODS
 
-        self.nodes = [Node(env, node_id=i, PowerState.ON) for i in range(NUMBER_OF_NODES)]
+        self.nodes = [Node(env, node_id=i, power_state=PowerState.ON) for i in range(NUMBER_OF_NODES)]
 
 
         self.node_state = np.array([0 for _ in range(self.number_of_nodes)])
@@ -215,15 +233,16 @@ class Cluster(object):
             (f"node idx must be smaller than total number of nodes: {self.number_of_nodes} "f"expected, got: {lowest_load_node}")
         return lowest_load_node
 
-    def idle_node_search(self) -> Any:
-        node_id = self.number_of_nodes
+    def idle_node_search(self) -> Any:          #return priority: IDLE > OFF > ON
+        max_node_id = self.number_of_nodes - 1
+        node_id = max_node_id
         for j in range(self.number_of_nodes):
-            if self.node_state[j] == PowerState.IDLE:
+            if self.nodes[j].power_state == PowerState.IDLE:
                 node_id = j
                 break
-        if (node_id == self.number_of_nodes):
+        if (node_id == max_node_id):
             for i in range(self.number_of_nodes):
-                if (self.node_state[i] == PowerState.OFF):
+                if (self.nodes[j].power_state == PowerState.OFF):
                     node_id = i
                     break
         return node_id
@@ -231,6 +250,8 @@ class Cluster(object):
 
     def scaleOut(self) -> Any:
         node_id = self.idle_node_search()
+        if(node_id == self.number_of_nodes):
+            return
 
         if (node_id < self.cluster.number_of_nodes):
             if (self.cluster.nodes[node_id].power_state == PowerState.OFF):
@@ -239,12 +260,15 @@ class Cluster(object):
                 self.cluster.nodes[node_id].power_state = PowerState.ON
 
 
-    def scaleIn(self, env, cluster) -> Any:
+    def scaleIn(self, env) -> Any:
         node_id = self.least_pods_node_search()
-        scale_in_node(env, cluster, node_id)
+        scale_in_node(env, cluster = self, node_id = node_id)
 
 
-def task(env, cluster, service_type):
+
+#TODO mindig legyen egy az idle nodeok es podok kozul kikapcoslva a megadott arany
+
+def task(env, cluster: Cluster, service_type):
     task_node_id = cluster.search_for_node()
     task_pod_id = cluster.nodes[task_node_id].search_for_pod(service_type)
 
@@ -254,16 +278,19 @@ def task(env, cluster, service_type):
 
     cluster.nodes[task_node_id].pods[task_pod_id].ram.get(service_type.value.ram)
     cluster.nodes[task_node_id].pods[task_pod_id].cpu.get(service_type.value.cpu)
+    cluster.nodes[task_node_id].num_tasks += 1
+    cluster.nodes[task_node_id].pods[task_pod_id].num_tasks += 1
 
     start = env.now
-    yield req
-    t = random.expovariate(SERVICE_RATE) #??????????????
+    t = random.expovariate(SERVICE_RATE) #???
     #  t=random.uniform(0.01,2)
-    #  t=1
 
+    
     yield env.timeout(t)
     cluster.nodes[task_node_id].pods[task_pod_id].ram.put(service_type.value.ram)
     cluster.nodes[task_node_id].pods[task_pod_id].cpu.put(service_type.value.cpu)
+    cluster.nodes[task_node_id].num_tasks -= 1
+    cluster.nodes[task_node_id].pods[task_pod_id].num_tasks -= 1
 #     if (cluster.nodes[task_node].count == 0 and
 #             cluster.nodes[task_node].power_state == PowerState.IDLE):
 #         cluster.nodes[task_node].power_state = PowerState.OFF
@@ -278,11 +305,12 @@ def start_node(env, cluster, node_id):
     cluster.node_state[node_id] = PowerState.ON
     cluster.active_num += 1
 
-def scale_in_node(env, cluster, node_id):
-    cluster.node_state[node_id] = PowerState.IDLE
-    cluster.active_num -= 1
+def scale_in_node(env, cluster: Cluster, node_id):
+    cluster.nodes[node_id].power_state = PowerState.IDLE
+    for pod in cluster.nodes[node_id].pods:
+        pod.power_state = PowerState.IDLE
 
-    scale_in_pods() #TODO
+    cluster.active_num -= 1
 
 def new_pod(env, cluster, node_id, service_type, power_state):
     yield env.timeout(BOOT_TIME_POD)
@@ -298,6 +326,7 @@ def terminate_pod(env, cluster, node_id, pod_id, service_type):
     cluster.nodes[node_id].pods.pop(pop_id)
     yield cluster.nodes[node_id].ram.put(service_type.value.ram)
     yield cluster.nodes[node_id].cpu.put(service_type.value.cpu)
+    cluster.nodes[node_id].pods.remove(pod_id)
 
 
 
@@ -364,6 +393,16 @@ class ClusterEnv(ExternalEnv):
                                      self.cluster.hosts[i].count)
     #    self.reset(seed=config.worker_index * config.num_workers)
 
+    def scale_pods_by_usage(self, service_type: ServiceType): #TODO
+        for node in self.cluster.nodes:
+            desired_pods = node.desired_replicas(POD_USAGE)
+
+            while(desired_pods != len(node.pods)):
+                if len(node.pods) > desired_pods:
+                    chosen_pod = search_for
+
+                    terminate_pod(env = self, cluster = self.cluster, node_id = node.node_id, pod_id = chosen_pod, service_type = service_type)
+
     def step(self, action):
         print("STEP?")
         return 100, 100, 100, {}
@@ -389,9 +428,11 @@ class ClusterEnv(ExternalEnv):
             self.eid = self.start_episode()
             #  print(self.eid)
             self.action = self.action_space.sample()
-            #  print(self.action)
-            #  print("Obs: ", obs)
-            #action = self.get_action(self.eid, obs)
+
+            
+
+
+
             if self.action == Action.ScaleIn and self.cluster.active_num == 1:
                 self.action == Action.Do_nothing
 
