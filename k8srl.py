@@ -124,6 +124,7 @@ class PowerState(IntEnum):
 #serverekbol lettek a podok
 
 Resources = namedtuple("Resources", ["ram", "cpu"])
+pod_idr = 0
 
 class ServiceType(Enum):
     typeA = Resources(ram = 128, cpu = 0.1)
@@ -207,12 +208,17 @@ class Node(object):
 class Cluster(object):
     def __init__(self, env: Any, number_of_nodes: int,) -> None:
         self.env = env
-        self.number_of_nodes = NUMBER_OF_NODES
+        self.number_of_nodes = number_of_nodes
 
-        self.nodes = [Node(env, node_id=i, power_state=PowerState.ON) for i in range(NUMBER_OF_NODES)]
+        self.nodes = [Node(env, node_id=i, power_state=PowerState.OFF) for i in range(NUMBER_OF_NODES)]
+        for id in range(4):
+            yield env.process(start_node(env, self, id))
 
-
-        self.node_state = np.array([0 for _ in range(self.number_of_nodes)])
+        for node in self.nodes:
+            if node.power_state == PowerState.ON:
+                node.pods.append(Pod(env, len(self.nodes), ServiceType.TypeA, PowerState.ON))
+                node.pods.append(Pod(env, len(self.nodes), ServiceType.TypeB, PowerState.ON))
+                node.pods.append(Pod(env, len(self.nodes), ServiceType.TypeC, PowerState.ON))
 
         self.digest = TDigest()     #  response time
         self.arrdigest = TDigest()  #  arrival time
@@ -222,21 +228,17 @@ class Cluster(object):
         self.active_nodes = 1
 
     def search_for_node(self) -> Any:
-        lowest_load_node = self.number_of_nodes - 1
-        for node in range(self.number_of_nodes):
-            if self.nodes[node].power_state == PowerState.ON:
-                lowest_load_node = node
+        lowest_load_node_id = -1
+        for node_id in range(self.number_of_nodes):
+            if (self.nodes[node_id].power_state == PowerState.ON):
+                lowest_load_node_id = node_id
                 break
-        for i in range(j + 1, self.number_of_nodes):
-            if (self.node_state[i] == PowerState.ON and
-                    len(self.nodes[i].queue) + self.nodes[i].count <
-                    len(self.nodes[lowest_load_node].queue) +
-                    self.hosts[lowest_load_node].count):
-                lowest_load_node = i
-
-        assert lowest_load_node < self.number_of_hosts, \
-            (f"node idx must be smaller than total number of nodes: {self.number_of_nodes} "f"expected, got: {lowest_load_node}")
-        return lowest_load_node
+        for node_id in range(self.number_of_nodes):
+            node = self.nodes[node_id]
+            lowest_load_node = self.nodes[lowest_load_node_id]
+            if (node.power_state == PowerState.ON and node.ram > lowest_load_node.ram):
+                lowest_load_node_id = node_id
+        return lowest_load_node_id
 
     def idle_node_search(self) -> Any:          #return priority: IDLE > OFF > ON
         max_node_id = self.number_of_nodes - 1
@@ -253,21 +255,23 @@ class Cluster(object):
         return node_id
 
 
-    def scaleOut(self) -> Any:
+    def scale_out(self) -> Any:
         node_id = self.idle_node_search()
         if(node_id == self.number_of_nodes):
             return
 
         if (node_id < self.cluster.number_of_nodes):
             if (self.cluster.nodes[node_id].power_state == PowerState.OFF):
-                yield self.k8env.process( start_node(self.k8env, self.cluster, node_id) )
+                yield self.k8env.process(start_node(self.k8env, self.cluster, node_id))
             else:
                 self.cluster.nodes[node_id].power_state = PowerState.ON
 
 
-    def scaleIn(self, env) -> Any:
+    def scale_in(self, env) -> Any:
         node_id = self.least_pods_node_search()
-        yield env.process(scale_in_node(env, cluster = self, node_id = node_id))  #kell yield? sztem nem
+        if node_id == 0:
+            return
+        yield env.process(scale_in_node(env, cluster = self, node_id = node_id))
 
 
 #TODO mindig legyen egy az idle nodeok es podok kozul kikapcoslva a megadott arany
@@ -295,11 +299,7 @@ def task(env, cluster: Cluster, service_type):
     cluster.nodes[task_node_id].pods[task_pod_id].cpu.put(service_type.value.cpu)
     cluster.nodes[task_node_id].num_tasks -= 1
     cluster.nodes[task_node_id].pods[task_pod_id].num_tasks -= 1
-#     if (cluster.nodes[task_node].count == 0 and
-#             cluster.nodes[task_node].power_state == PowerState.IDLE):
-#         cluster.nodes[task_node].power_state = PowerState.OFF
 
-    cluster.active_num -= 1 #???????
     cluster.digest.update(env.now - start)
 
 
@@ -307,14 +307,24 @@ def task(env, cluster: Cluster, service_type):
 def start_node(env, cluster, node_id):
     yield env.timeout(BOOT_TIME_NODE)
     cluster.node_state[node_id] = PowerState.ON
-    cluster.active_num += 1
+    cluster.active_node += 1
+    yield env.process(start_pod(env, cluster, node_id, ServiceType.typeA))
+    yield env.process(start_pod(env, cluster, node_id, ServiceType.typeB))
+    yield env.process(start_pod(env, cluster, node_id, ServiceType.typeC))
+
+def start_pod(env, cluster: Cluster, node_id, service_type: ServiceType):
+    new_pod = Pod(env, pod_id = pod_idr, service_type = service_type, power_state = PowerState.ON)
+    cluster.nodes[node_id].pods.append(new_pod)
+    pod_idr += 1
+    yield env.timeout(1)
+
 
 def scale_in_node(env, cluster: Cluster, node_id):
     cluster.nodes[node_id].power_state = PowerState.IDLE
     for pod in cluster.nodes[node_id].pods:
         env.process(terminate_pod(env, cluster, node_id, pod_id))
 
-    cluster.active_num -= 1
+    cluster.active_node -= 1
 
 def new_pod(env, cluster, node_id, service_type, power_state):
     yield env.timeout(BOOT_TIME_POD)
@@ -394,15 +404,7 @@ class ClusterEnv(ExternalEnv):
         self.loop = 0
         self.arr = np.zeros(shape=(self.percentile_points,))
         self.ser = np.zeros(shape=(self.percentile_points,))
-#         for i in range(self.cluster.number_of_hosts):
-#             self.numofcustomer[i] = (len(self.cluster.hosts[i].queue) +
-#                                      self.cluster.hosts[i].count)
-    #    self.reset(seed=config.worker_index * config.num_workers)
 
-    def scale_start(self):
-        if not self.scale_running:
-            self.scale_running = True
-            self.k8env.process(self.scale_pods_by_usage)
 
     def scale_pods_by_usage(self): #TODO
         try:
@@ -437,7 +439,6 @@ class ClusterEnv(ExternalEnv):
             nodes_task_num.append(node.num_tasks)
         obs = tuple([self.arr, self.ser, nodes_ram_usage, nodes_task_num])
 
-        self.scale_start()
         while True:
             if(self.loop % 100 == 0) :
                print("cluster control ", self.nc, "time", self.k8env.now)
@@ -445,15 +446,15 @@ class ClusterEnv(ExternalEnv):
             self.episode_id = self.start_episode()
             self.action = self.action_space.sample()
 
-            if (self.action == Action.ScaleIn and self.cluster.active_num == 1) or (self.action == Action.ScaleOut and self.cluster.active_num == self.cluster.number_of_hosts):
-                self.action == Action.Do_nothing
+            if (self.action == Action.ScaleIn and self.cluster.active_node == 1) or (self.action == Action.ScaleOut and self.cluster.active_node == self.cluster.number_of_nodes):
+                self.action = Action.Do_nothing
 
             self.log_action(self.episode_id, obs, self.action)
 
             if self.action == Action.ScaleOut:
-                yield self.k8env.process(self.cluster.scaleOut)
+                yield self.k8env.process(self.cluster.scale_out)
             elif self.action == Action.ScaleIn:
-                yield self.k8env.process(self.cluster.scaleIn)
+                yield self.k8env.process(self.cluster.scale_in)
 
             yield  #nem kell sztem yield mivel paralell mehetnek ezek de idk lehet nem jo
             #  Check every 10 seconds
@@ -491,7 +492,9 @@ class ClusterEnv(ExternalEnv):
     def run(self):
         self.k8env.process(self.cluster_control())
         self.k8env.process(customer_generator(self.k8env, self.cluster))
-        self.k8env.process(self.scale_pods_by_usage())  #vigyazz ez lehet atkapcsol podokat mikozben nem kene
+        if not self.scale_running:
+                    self.scale_running = True
+                    self.k8env.process(self.scale_pods_by_usage())  #vigyazz ez lehet atkapcsol podokat mikozben nem kene
         print("--Starting simulation--")
         self.k8env.run(until=SIM_TIME)
         print("--Simulation ended--")
@@ -519,9 +522,6 @@ if __name__ == "__main__":
             .rollouts(num_rollout_workers=1, enable_connectors=False)
     )
     dqn = config.build()
-    #algo = dqn.DQN(env="cluster-env-v01")
-    # policy_dict, is_policy_to_train = config.get_multi_agent_setup(env="cluster-env-v01")
-    # is_policy_to_train("pol1")
 
 
 
