@@ -267,8 +267,7 @@ class Cluster(object):
 
     def scaleIn(self, env) -> Any:
         node_id = self.least_pods_node_search()
-        scale_in_node(env, cluster = self, node_id = node_id)
-
+        yield env.process(scale_in_node(env, cluster = self, node_id = node_id))  #kell yield? sztem nem
 
 
 #TODO mindig legyen egy az idle nodeok es podok kozul kikapcoslva a megadott arany
@@ -313,7 +312,7 @@ def start_node(env, cluster, node_id):
 def scale_in_node(env, cluster: Cluster, node_id):
     cluster.nodes[node_id].power_state = PowerState.IDLE
     for pod in cluster.nodes[node_id].pods:
-        pod.power_state = PowerState.IDLE
+        env.process(terminate_pod(env, cluster, node_id, pod_id))
 
     cluster.active_num -= 1
 
@@ -341,9 +340,19 @@ def terminate_pod(env, cluster: Cluster, node_id, pod_id):
 
 
 
-def customer_generator(env, cluster):
-    """ Generate new customers that arrive at the cluster."""
+def task_generator(env, cluster):
     for i in itertools.count():
+        task_type = i % 3
+        switch(task_type):
+            case 0:
+                service_type = ServiceType.TypeA
+                break
+            case 1:
+                service_type = ServiceType.TypeB
+                break
+            case 2:
+                service_type = ServiceType.TypeC
+                break
         if env.now < SIM_TIME/2:
             t = random.expovariate(ARRIVAL_RATE)
         elif env.now < SIM_TIME*3/4:
@@ -352,10 +361,10 @@ def customer_generator(env, cluster):
             t = random.expovariate(ARRIVAL_RATE/4)
         cluster.arrdigest.update(t)
         yield env.timeout(t)
-        env.process(customer('Customer %d' % i, env, cluster,))
+        env.process(task(env, cluster, service_type))
 
         if (i % 20000 ==0) :
-           print('customer', i, "time --", env.now)
+           print('task', i, "time --", env.now, 'service type is:', service_type,)
 
 class ClusterEnv(ExternalEnv):
     def __init__(self, config: EnvContext):
@@ -404,11 +413,12 @@ class ClusterEnv(ExternalEnv):
                         if len(node.pods) > desired_pods:
                             chosen_pod = node.oldest_pod_search()
                             service_type = node.pods[chosen_pod].service_type
-                            yield terminate_pod(env = self.k8env, cluster = self.cluster, node_id = node.node_id, pod_id = chosen_pod, service_type = chosen_pod.service_type)
+                            yield self.k8env.process(terminate_pod(env = self.k8env, cluster = self.cluster, node_id = node.node_id, pod_id = chosen_pod, service_type = chosen_pod.service_type))
                         #elif len(node.pods) < desired_pods
                 yield self.k8env.timeout(1)
         finally:
             self.scale_running = False
+
 
     def step(self, action):
         print("STEP?")
@@ -439,28 +449,13 @@ class ClusterEnv(ExternalEnv):
                 self.action == Action.Do_nothing
 
             self.log_action(self.episode_id, obs, self.action)
-            
-            yield self.k8env.process(self.scale_pods_by_usage()) #itt a yield miatt megallitja az egesz loopot lehet tul sokaig
 
             if self.action == Action.ScaleOut:
-                hostid = self.cluster.search_for_off_host()
-                #  print("scale out, host %d" %hostid)
-                if hostid < self.cluster.number_of_hosts:
-                    if self.cluster.host_state[hostid] == PowerState.OFF:
-                        yield self.k8env.process(start_host(self.k8env,
-                            self.cluster, hostid))
-                    else:
-                        self.cluster.host_state[hostid] = PowerState.ON_A
+                yield self.k8env.process(self.cluster.scaleOut)
             elif self.action == Action.ScaleIn:
-                hostid = self.cluster.search_for_allocation()
-                #  print("scale in, host %d" % hostid)
-                if (self.cluster.hosts[hostid].count == 0 and
-                        len(self.cluster.hosts[hostid].queue) == 0):
-                    self.cluster.host_state[hostid] = PowerState.OFF
-                    self.cluster.active_num -= 1
-                else:
-                    self.cluster.host_state[hostid] = PowerState.ON_N
-                    #  print('No of active hosts %d' % self.cluster.active_num)
+                yield self.k8env.process(self.cluster.scaleIn)
+
+            yield  #nem kell sztem yield mivel paralell mehetnek ezek de idk lehet nem jo
             #  Check every 10 seconds
             #  reward here and observation
             del self.cluster.digest
@@ -496,6 +491,7 @@ class ClusterEnv(ExternalEnv):
     def run(self):
         self.k8env.process(self.cluster_control())
         self.k8env.process(customer_generator(self.k8env, self.cluster))
+        self.k8env.process(self.scale_pods_by_usage())  #vigyazz ez lehet atkapcsol podokat mikozben nem kene
         print("--Starting simulation--")
         self.k8env.run(until=SIM_TIME)
         print("--Simulation ended--")
