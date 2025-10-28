@@ -57,7 +57,6 @@ NUM_ARRIVALS = 10000
 CONTROL_TIME_INTERVAL = 30.0
 
 NUMBER_OF_NODES = 10
-NUMBER_OF_PODS = 5
 NODE_RAM = 16000
 NODE_CORE = 8
 POD_USAGE = 90
@@ -209,7 +208,6 @@ class Cluster(object):
     def __init__(self, env: Any, number_of_nodes: int,) -> None:
         self.env = env
         self.number_of_nodes = NUMBER_OF_NODES
-        self.number_of_pods = NUMBER_OF_PODS
 
         self.nodes = [Node(env, node_id=i, power_state=PowerState.ON) for i in range(NUMBER_OF_NODES)]
 
@@ -361,32 +359,20 @@ def customer_generator(env, cluster):
 
 class ClusterEnv(ExternalEnv):
     def __init__(self, config: EnvContext):
-
-        self.number_of_hosts = config["number_of_hosts"]
-        self.num_of_pods = config["num_of_pods"]
+        self.number_of_nodes = config["number_of_nodes"]
         self.percentile_points = config["percentile_points"]
         self.scale_running = False
         self.observation_space = Tuple(
           [
-             Box(0, np.inf, shape=(self.percentile_points,),
-                            dtype=np.float64),
-             #  Arrival cdf
-             Box(0, np.inf, shape=(self.percentile_points,),
-                            dtype=np.float64),
-             #  response
-             Box(0, 2, shape=(self.number_of_hosts,),
-                            dtype=np.int64),
-             #  state of hosts -- off, ON_A, ON_N
-             Box(0, 10000, shape=(self.number_of_hosts,),
-                            dtype=np.int64),
-             #  number of customers at hosts
-             #  Discrete(self.number_of_hosts),
-             #  number of active hosts,  number of servers
-             #  Discrete(self.number_of_host*self.capacity+1)
+            Box(0, np.inf, shape=(self.percentile_points,),dtype=np.float64),# Arrival cdf
+
+            Box(0, np.inf, shape=(self.percentile_points,),dtype=np.float64),# response
+
+            Box(0, NODE_RAM, shape=(self.number_of_nodes,),dtype=np.int64),#   ram usage
+
+            Box(0, np.inf, shape=(self.number_of_nodes,),dtype=np.int64),#     number of tasks on each node
           ]
         )
-        print("Initialization ---")
-        #  print(self.observation_space)
         print("Initialization ---")
         self.action_space = Discrete(3)
         env_config = {
@@ -395,15 +381,13 @@ class ClusterEnv(ExternalEnv):
         }
         ExternalEnv.__init__(self, self.action_space, self.observation_space)
         self.k8env = simpy.Environment()
-        self.cluster = Cluster(self.k8env, self.number_of_hosts,
-                               self.num_servers)
-        self.nc = 0
+        self.cluster = Cluster(self.k8env, self.number_of_nodes)
+        self.loop = 0
         self.arr = np.zeros(shape=(self.percentile_points,))
         self.ser = np.zeros(shape=(self.percentile_points,))
-        self.numofcustomer = np.zeros(shape=(self.cluster.number_of_hosts,))
-        for i in range(self.cluster.number_of_hosts):
-            self.numofcustomer[i] = (len(self.cluster.hosts[i].queue) +
-                                     self.cluster.hosts[i].count)
+#         for i in range(self.cluster.number_of_hosts):
+#             self.numofcustomer[i] = (len(self.cluster.hosts[i].queue) +
+#                                      self.cluster.hosts[i].count)
     #    self.reset(seed=config.worker_index * config.num_workers)
 
     def scale_start(self):
@@ -420,7 +404,8 @@ class ClusterEnv(ExternalEnv):
                         if len(node.pods) > desired_pods:
                             chosen_pod = node.oldest_pod_search()
                             service_type = node.pods[chosen_pod].service_type
-                            yield terminate_pod(env = self.k8env, cluster = self.cluster, node_id = node.node_id, pod_id = chosen_pod, servicetype = chosen_pod.service_type)
+                            yield terminate_pod(env = self.k8env, cluster = self.cluster, node_id = node.node_id, pod_id = chosen_pod, service_type = chosen_pod.service_type)
+                        #elif len(node.pods) < desired_pods
                 yield self.k8env.timeout(1)
         finally:
             self.scale_running = False
@@ -430,41 +415,30 @@ class ClusterEnv(ExternalEnv):
         return 100, 100, 100, {}
 
     def cluster_control(self):
-        #  Periodically manages the cluster"""
-        #  print("cluster control ---")
         yield self.k8env.timeout(CONTROL_TIME_INTERVAL)
         for i in range(self.percentile_points):
             self.arr[i] = self.cluster.arrdigest.percentile(i)
             self.ser[i] = self.cluster.digest.percentile(i)
-        for i in range(self.cluster.number_of_hosts):
-            self.numofcustomer[i] = (len(self.cluster.hosts[i].queue) +
-                                     self.cluster.hosts[i].count)
 
-        obs = tuple([self.arr, self.ser, self.cluster.host_state,
-                     self.numofcustomer])
+        nodes_ram_usage = []
+        nodes_task_num = []
+        for node in self.cluster.nodes:
+            nodes_ram_usage.append(node.ram)
+            nodes_task_num.append(node.num_tasks)
+        obs = tuple([self.arr, self.ser, nodes_ram_usage, nodes_task_num])
 
         self.scale_start()
         while True:
-            #  perform acion
-            if(self.nc % 100 == 0) :
+            if(self.loop % 100 == 0) :
                print("cluster control ", self.nc, "time", self.k8env.now)
-            self.nc +=1
-            self.eid = self.start_episode()
-            #  print(self.eid)
+            self.loop +=1
+            self.episode_id = self.start_episode()
             self.action = self.action_space.sample()
 
-            
-
-
-
-            if self.action == Action.ScaleIn and self.cluster.active_num == 1:
+            if (self.action == Action.ScaleIn and self.cluster.active_num == 1) or (self.action == Action.ScaleOut and self.cluster.active_num == self.cluster.number_of_hosts):
                 self.action == Action.Do_nothing
 
-            if (self.action == Action.ScaleOut and
-                    self.cluster.active_num == self.cluster.number_of_hosts):
-                self.action == Action.Do_nothing
-
-            self.log_action(self.eid, obs, self.action)
+            self.log_action(self.episode_id, obs, self.action)
             
             yield self.k8env.process(self.scale_pods_by_usage()) #itt a yield miatt megallitja az egesz loopot lehet tul sokaig
 
@@ -499,37 +473,25 @@ class ClusterEnv(ExternalEnv):
             for i in range(self.percentile_points):
                 self.arr[i] = self.cluster.arrdigest.percentile(i)
                 self.ser[i] = self.cluster.digest.percentile(i)
-            for i in range(self.cluster.number_of_hosts):
-                self.numofcustomer[i] = (len(self.cluster.hosts[i].queue)
-                                         + self.cluster.hosts[i].count)
-                if self.numofcustomer[i] < 0:
-                    print("ERROR")
-            obs = tuple([self.arr, self.ser,
-                         self.cluster.host_state, self.numofcustomer])
+            for node in self.cluster.nodes:
+                node_id = node.node_id
+                nodes_ram_usage[node_id](node.ram)
+                nodes_task_num[node_id(node.num_tasks)
+
+            obs = tuple([self.arr, self.ser, nodes_ram_usage, nodes_task_num])
             excess_time = RESPONSE_TIME_THRESHOLD_U - self.cluster.digest.percentile(99.9)
             if (self.cluster.digest.percentile(99.9) >
                     RESPONSE_TIME_THRESHOLD_U):
                 reward = -1 * math.log2(abs(excess_time))/2 * (self.action + 1)
             else:
                 reward = excess_time * (self.action + 1) + 2
-
-            #  compute reward, obs,info
             info = ""
-            #  print(obs)
-            #  print(reward)
-            self.log_returns(self.eid, reward, info=info)
-            self.end_episode(self.eid, obs)
+            self.log_returns(self.episode_id, reward, info=info)
+            self.end_episode(self.episode_id, obs)
             del self.cluster.digest
             self.cluster.digest = TDigest()
             del self.cluster.arrdigest
             self.cluster.arrdigest = TDigest()
-            #  print('No of active hosts %d' % cluster.active_num)
-            #  print("99.9 percentile %f" % cluster.digest.percentile(99.9))
-            #  print("60 percentile %f" % cluster.digest.percentile(60))
-            #  print("50 percentile %f" % cluster.digest.percentile(50))
-            #  print("10 percentile %f" % cluster.digest.percentile(10))
-            #  a consequence of  the previous action
-            #  construct observation
 
     def run(self):
         self.k8env.process(self.cluster_control())
@@ -552,7 +514,7 @@ if __name__ == "__main__":
     ray.init(local_mode=args.local_mode,num_gpus=1)
 
     register_env("k8-env", lambda _: ClusterEnv(config={
-     "number_of_nodes": NUMBER_OF_NODES, "num_servers": NUMBER_OF_PODS, "percentile_points": 100}))
+     "number_of_nodes": NUMBER_OF_NODES, "percentile_points": 100}))
 
 
     config = (
