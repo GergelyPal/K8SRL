@@ -135,6 +135,7 @@ class Pod(object):
     def __init__(self, env: Any, pod_id: int, service_type: ServiceType , power_state: PowerState) -> None:
         self.env = env
         self.pod_id = pod_id
+        self.birth = env.now
         self.service_type = service_type
 
         self.power_state = power_state
@@ -196,7 +197,13 @@ class Node(object):
                     break
         return pod_id
 
-
+    def oldest_pod_search(self) -> Any:
+        pod_id = 0
+        for pod in self.pods:
+            if pod.birth < self.pods[pod_id].birth:
+                pod_id = pod.pod_id
+                break
+        return pod_id
 
 class Cluster(object):
     def __init__(self, env: Any, number_of_nodes: int,) -> None:
@@ -322,10 +329,16 @@ def new_pod(env, cluster, node_id, service_type, power_state):
     yield cluster.nodes[node_id].ram.get(service_type.value.ram)
     yield cluster.nodes[node_id].cpu.get(service_type.value.cpu)
 
-def terminate_pod(env, cluster, node_id, pod_id, service_type):
-    cluster.nodes[node_id].pods.pop(pop_id)
-    yield cluster.nodes[node_id].ram.put(service_type.value.ram)
-    yield cluster.nodes[node_id].cpu.put(service_type.value.cpu)
+def terminate_pod(env, cluster: Cluster, node_id, pod_id):
+    node = cluster.nodes[node_id]
+    service_type = node.pods[pod_id].service_type
+
+    while node.pods[pod_id].num_tasks != 0:
+        yield env.timeout(1)
+
+    cluster.nodes[node_id].pods.pop(pod_id)
+    yield node.ram.put(service_type.value.ram)
+    yield node.cpu.put(service_type.value.cpu)
     cluster.nodes[node_id].pods.remove(pod_id)
 
 
@@ -352,7 +365,7 @@ class ClusterEnv(ExternalEnv):
         self.number_of_hosts = config["number_of_hosts"]
         self.num_of_pods = config["num_of_pods"]
         self.percentile_points = config["percentile_points"]
-        self.number_of_active_hosts = 1
+        self.scale_running = False
         self.observation_space = Tuple(
           [
              Box(0, np.inf, shape=(self.percentile_points,),
@@ -393,15 +406,24 @@ class ClusterEnv(ExternalEnv):
                                      self.cluster.hosts[i].count)
     #    self.reset(seed=config.worker_index * config.num_workers)
 
-    def scale_pods_by_usage(self, service_type: ServiceType): #TODO
-        for node in self.cluster.nodes:
-            desired_pods = node.desired_replicas(POD_USAGE)
+    def scale_start(self):
+        if not self.scale_running:
+            self.scale_running = True
+            self.k8env.process(self.scale_pods_by_usage)
 
-            while(desired_pods != len(node.pods)):
-                if len(node.pods) > desired_pods:
-                    chosen_pod = search_for
-
-                    terminate_pod(env = self, cluster = self.cluster, node_id = node.node_id, pod_id = chosen_pod, service_type = service_type)
+    def scale_pods_by_usage(self): #TODO
+        try:
+            while True:
+                for node in self.cluster.nodes:
+                    desired_pods = node.desired_replicas(POD_USAGE)
+                    while(desired_pods != len(node.pods)):
+                        if len(node.pods) > desired_pods:
+                            chosen_pod = node.oldest_pod_search()
+                            service_type = node.pods[chosen_pod].service_type
+                            yield terminate_pod(env = self.k8env, cluster = self.cluster, node_id = node.node_id, pod_id = chosen_pod, servicetype = chosen_pod.service_type)
+                yield self.k8env.timeout(1)
+        finally:
+            self.scale_running = False
 
     def step(self, action):
         print("STEP?")
@@ -420,6 +442,8 @@ class ClusterEnv(ExternalEnv):
 
         obs = tuple([self.arr, self.ser, self.cluster.host_state,
                      self.numofcustomer])
+
+        self.scale_start()
         while True:
             #  perform acion
             if(self.nc % 100 == 0) :
@@ -441,8 +465,9 @@ class ClusterEnv(ExternalEnv):
                 self.action == Action.Do_nothing
 
             self.log_action(self.eid, obs, self.action)
-            #  print("Action %d" % self.action)
-            #  print(obs)
+            
+            yield self.k8env.process(self.scale_pods_by_usage()) #itt a yield miatt megallitja az egesz loopot lehet tul sokaig
+
             if self.action == Action.ScaleOut:
                 hostid = self.cluster.search_for_off_host()
                 #  print("scale out, host %d" %hostid)
