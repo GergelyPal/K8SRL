@@ -173,12 +173,13 @@ class Node(object):
         return pod_id
 
 
-    def desired_replicas(self, desired_usage):
+    def desired_replicas(self, desired_usage, service_type: ServiceType):
         avr_usage = 0
         for pod in self.pods:
-            used_ram = pod.ram.capacity - pod.ram.level
-            ram_usage = used_ram / pod.ram.capacity * 100
-            avr_usage += ram_usage
+            if pod.service_type == service_type:
+                used_ram = pod.ram.capacity - pod.ram.level
+                ram_usage = used_ram / pod.ram.capacity * 100
+                avr_usage += ram_usage
 
         avr_usage = avr_usage / len(self.pods)
         x = len(self.pods) * (avr_usage / desired_usage)
@@ -197,10 +198,10 @@ class Node(object):
                     break
         return pod_id
 
-    def oldest_pod_search(self) -> Any:
+    def oldest_pod_search(self, service_type: ServiceType) -> Any:
         pod_id = 0
         for pod in self.pods:
-            if pod.birth < self.pods[pod_id].birth:
+            if pod.birth < self.pods[pod_id].birth and pod.service_type == service_type:
                 pod_id = pod.pod_id
                 break
         return pod_id
@@ -406,17 +407,18 @@ class ClusterEnv(ExternalEnv):
         self.ser = np.zeros(shape=(self.percentile_points,))
 
 
-    def scale_pods_by_usage(self): #TODO
+    def scale_pods_by_usage(self, service_type: ServiceType): #TODO finish and check upscaling. maybe handle idling instead of termination and start
         try:
             while True:
                 for node in self.cluster.nodes:
-                    desired_pods = node.desired_replicas(POD_USAGE)
+                    desired_pods = node.desired_replicas(POD_USAGE, service_type)
                     while(desired_pods != len(node.pods)):
                         if len(node.pods) > desired_pods:
-                            chosen_pod = node.oldest_pod_search()
-                            service_type = node.pods[chosen_pod].service_type
-                            yield self.k8env.process(terminate_pod(env = self.k8env, cluster = self.cluster, node_id = node.node_id, pod_id = chosen_pod, service_type = chosen_pod.service_type))
-                        #elif len(node.pods) < desired_pods
+                            chosen_pod_id = node.oldest_pod_search(service_type)
+                            yield self.k8env.process(terminate_pod(env = self.k8env, cluster = self.cluster, node_id = node.node_id, pod_id = chosen_pod_id, service_type = service_type))
+
+                        elif len(node.pods) < desired_pods:
+                            yield env.process(start_pod(self.k8env, self.cluster, node.node_id, service_type))
                 yield self.k8env.timeout(1)
         finally:
             self.scale_running = False
@@ -456,7 +458,6 @@ class ClusterEnv(ExternalEnv):
             elif self.action == Action.ScaleIn:
                 yield self.k8env.process(self.cluster.scale_in)
 
-            yield  #nem kell sztem yield mivel paralell mehetnek ezek de idk lehet nem jo
             #  Check every 10 seconds
             #  reward here and observation
             del self.cluster.digest
@@ -489,12 +490,20 @@ class ClusterEnv(ExternalEnv):
             del self.cluster.arrdigest
             self.cluster.arrdigest = TDigest()
 
+    def start_pod_scaler(self, service_type: ServiceType):
+        while True:
+            if not self.scale_running:
+                self.scale_running = True
+                yield self.k8env.process(self.scale_pods_by_usage(service_type))
+
     def run(self):
         self.k8env.process(self.cluster_control())
         self.k8env.process(customer_generator(self.k8env, self.cluster))
-        if not self.scale_running:
-                    self.scale_running = True
-                    self.k8env.process(self.scale_pods_by_usage())  #vigyazz ez lehet atkapcsol podokat mikozben nem kene
+
+        self.k8env.process(self.start_pod_scaler(ServiceType.TypeA))
+        self.k8env.process(self.start_pod_scaler(ServiceType.TypeB))
+        self.k8env.process(self.start_pod_scaler(ServiceType.TypeC))
+
         print("--Starting simulation--")
         self.k8env.run(until=SIM_TIME)
         print("--Simulation ended--")
