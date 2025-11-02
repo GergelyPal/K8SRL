@@ -278,14 +278,13 @@ class Cluster(object):
 
     def scale_out(self) -> Any:
         node_id = self.idle_node_search()
-        if(node_id == self.number_of_nodes):
-            return
+        node = self.nodes[node_id]
 
-        if (node_id < self.cluster.number_of_nodes):
-            if (self.cluster.nodes[node_id].power_state == PowerState.OFF):
-                yield self.k8env.process(start_node(self.k8env, self.cluster, node_id))
-            else:
-                self.cluster.nodes[node_id].power_state = PowerState.ON
+        if (node_id < self.number_of_nodes):
+            if (node.power_state == PowerState.OFF):
+                yield self.env.process(start_off_node(self.env, self.cluster, node_id))
+            elif(node.power_state == PowerState.IDLE):
+                yield self.env.process(wake_node(self.env, cluster = self, node_id = node_id))
 
 
     def scale_in(self, env) -> Any:
