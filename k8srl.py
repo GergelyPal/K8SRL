@@ -268,10 +268,10 @@ class Cluster(object):
                 yield self.env.process(wake_node(self.env, cluster = self, node_id = node_id))
 
 
-    def scale_in(self, env) -> Any:
+    def scale_in(self) -> Any:
         node_id = self.search_for_node()
         if is_id_valid(node_id):
-            yield env.process(scale_in_node(env, cluster = self, node_id = node_id))
+            yield self.env.process(scale_in_node(self.env, cluster = self, node_id = node_id))
 
 def is_id_valid(id: int):
     if(id < 0):
@@ -499,6 +499,8 @@ class ClusterEnv(ExternalEnv):
     def cluster_control(self):
         print('Cluster control has started')
         yield self.k8env.process(self.cluster.start_nodes(4))
+
+        yield self.k8env.timeout(CLUSTER_CONTROL_TIME)
         for i in range(self.percentile_points):
             self.arr[i] = self.cluster.arrdigest.percentile(i)
             self.ser[i] = self.cluster.digest.percentile(i)
@@ -517,7 +519,7 @@ class ClusterEnv(ExternalEnv):
             self.episode_id = self.start_episode()
             self.action = self.action_space.sample()
 
-            if(self.action == Action.ScaleOut and self.cluster.active_nodes == self.cluster.number_of_nodes): #or  (self.action == Action.ScaleIn and self.cluster.active_node == 1)
+            if(self.action == Action.ScaleOut and self.cluster.active_nodes == self.cluster.number_of_nodes):
                 self.action = Action.Do_nothing
 
             elif self.action == Action.ScaleOut:
