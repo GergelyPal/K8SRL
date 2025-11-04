@@ -496,22 +496,23 @@ class ClusterEnv(ExternalEnv):
         print("STEP?")
         return 100, 100, 100, {}
 
+    def digestor(self):
+        for i in range(self.percentile_points):
+            if len(self.cluster.digest.n) == 0:
+                self.arr[i] = 0
+                self.ser[i] = 0
+                print('arr, serr got 0 values')
+            else:
+                self.arr[i] = self.cluster.arrdigest.percentile(i)
+                self.ser[i] = self.cluster.digest.percentile(i)
+
     def cluster_control(self):
         print('Cluster control has started')
         yield self.k8env.process(self.cluster.start_nodes(4))
 
         yield self.k8env.timeout(CLUSTER_CONTROL_TIME)
-        for i in range(self.percentile_points):
-            if len(self.cluster.digest) == 0:
-                self.arr[i] = 0
-                self.ser[i] = 0
-                print('digest size normally: ', len(self.cluster.digest))
-            else:
-                try:
-                    self.arr[i] = self.cluster.arrdigest.percentile(i)
-                    self.ser[i] = self.cluster.digest.percentile(i)
-                except Exception:
-                    print('digest size when crashing: ', len(self.cluster.digest))
+        self.digestor()
+
 
         nodes_ram_usage = []
         nodes_task_num = []
@@ -537,7 +538,6 @@ class ClusterEnv(ExternalEnv):
 
             self.log_action(self.episode_id, obs, self.action)
 
-            #  reward here and observation
             del self.cluster.digest
             self.cluster.digest = TDigest()
             del self.cluster.arrdigest
@@ -545,9 +545,8 @@ class ClusterEnv(ExternalEnv):
 
             yield self.k8env.timeout(CLUSTER_CONTROL_TIME)
 
-            for i in range(self.percentile_points):
-                self.arr[i] = self.cluster.arrdigest.percentile(i)
-                self.ser[i] = self.cluster.digest.percentile(i)
+            self.digestor()
+
             for node in self.cluster.nodes:
                 nodes_ram_usage[node.id] = node.ram.level
                 nodes_task_num[node.id] = node.num_tasks
