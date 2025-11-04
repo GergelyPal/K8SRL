@@ -505,10 +505,13 @@ class ClusterEnv(ExternalEnv):
             if len(self.cluster.digest) == 0:
                 self.arr[i] = 0
                 self.ser[i] = 0
+                print('digest size normally: ', len(self.cluster.digest))
             else:
-                print('digest size when crashing: ', len(self.cluster.digest))
-                self.arr[i] = self.cluster.arrdigest.percentile(i)
-                self.ser[i] = self.cluster.digest.percentile(i)
+                try:
+                    self.arr[i] = self.cluster.arrdigest.percentile(i)
+                    self.ser[i] = self.cluster.digest.percentile(i)
+                except Exception:
+                    print('digest size when crashing: ', len(self.cluster.digest))
 
         nodes_ram_usage = []
         nodes_task_num = []
