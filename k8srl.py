@@ -58,7 +58,7 @@ IDLE_ACTIVE_RATIO = 0.2
 
 SIM_TIME = 110000000            # Simulation time in seconds
 NUM_ARRIVALS = 10000
-CONTROL_TIME_INTERVAL = 30.0
+CLUSTER_CONTROL_TIME = 5
 
 NUMBER_OF_NODES = 10
 NODE_RAM = 16000
@@ -500,7 +500,7 @@ class ClusterEnv(ExternalEnv):
         return 100, 100, 100, {}
 
     def cluster_control(self):
-        yield self.k8env.timeout(CONTROL_TIME_INTERVAL)
+        #yield self.k8env.timeout(CONTROL_TIME_INTERVAL)
         for i in range(self.percentile_points):
             self.arr[i] = self.cluster.arrdigest.percentile(i)
             self.ser[i] = self.cluster.digest.percentile(i)
@@ -514,29 +514,28 @@ class ClusterEnv(ExternalEnv):
 
         while True:
             if(self.loop % 100 == 0) :
-               print("cluster control ", self.nc, "time", self.k8env.now)
+               print("time", self.k8env.now)
             self.loop +=1
             self.episode_id = self.start_episode()
             self.action = self.action_space.sample()
 
-            if (self.action == Action.ScaleIn and self.cluster.active_node == 1) or (self.action == Action.ScaleOut and self.cluster.active_node == self.cluster.number_of_nodes):
+            if(self.action == Action.ScaleOut and self.cluster.active_node == self.cluster.number_of_nodes): #or  (self.action == Action.ScaleIn and self.cluster.active_node == 1)
                 self.action = Action.Do_nothing
 
-            self.log_action(self.episode_id, obs, self.action)
-
-            if self.action == Action.ScaleOut:
+            elif self.action == Action.ScaleOut:
                 yield self.k8env.process(self.cluster.scale_out)
             elif self.action == Action.ScaleIn:
                 yield self.k8env.process(self.cluster.scale_in)
 
-            #  Check every 10 seconds
+            self.log_action(self.episode_id, obs, self.action)
+
             #  reward here and observation
             del self.cluster.digest
             self.cluster.digest = TDigest()
             del self.cluster.arrdigest
             self.cluster.arrdigest = TDigest()
 
-            yield self.k8env.timeout(CONTROL_TIME_INTERVAL)
+            yield self.k8env.timeout(CLUSTER_CONTROL_TIME)
 
             for i in range(self.percentile_points):
                 self.arr[i] = self.cluster.arrdigest.percentile(i)
