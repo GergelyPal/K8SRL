@@ -284,9 +284,9 @@ def task(env, cluster: Cluster, service_type: ServiceType):
     task_pod_id = -1
     retry = 0
     while(not is_id_valid(task_pod_id)):
-        if(retry % 10 == 3):
+        if(retry % 2 == 30):
             print('task retried pod search:', retry, 'times, service type is:', service_type)
-            if(retry == 100):
+            if(retry == 150):
                 return
         task_node_id = cluster.search_for_node()
         task_pod_id = cluster.nodes[task_node_id].least_used_pod(service_type)
@@ -502,10 +502,11 @@ class ClusterEnv(ExternalEnv):
 
         yield self.k8env.timeout(CLUSTER_CONTROL_TIME)
         for i in range(self.percentile_points):
-            if len(self.cluster.digest) == 0:
+            if self.cluster.digest.__sizeof__() == 0:
                 self.arr[i] = 0
                 self.ser[i] = 0
             else:
+                print('digest size: ', self.cluster.digest.__sizeof__())
                 self.arr[i] = self.cluster.arrdigest.percentile(i)
                 self.ser[i] = self.cluster.digest.percentile(i)
 
