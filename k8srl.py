@@ -41,15 +41,15 @@ IDLE_ACTIVE_RATIO = 0.2
 
 SIM_TIME = 110000000            # Simulation time in seconds
 NUM_ARRIVALS = 10000
-CLUSTER_CONTROL_TIME = 5
+CLUSTER_CONTROL_TIME = 100
 
-NUMBER_OF_NODES = 10
+NUMBER_OF_NODES = 15
 NODE_RAM = 16000
 NODE_CORE = 8
 POD_USAGE = 90
 
-ARRIVAL_RATE = 2.
-SERVICE_RATE = 2.0
+ARRIVAL_RATE = 1.
+SERVICE_RATE = 1.2
 SERVICE_TIME = 1.2
 RESPONSE_TIME_THRESHOLD_D = 1.3
 RESPONSE_TIME_THRESHOLD_U = 4.0
@@ -271,7 +271,7 @@ class Cluster(object):
     def scale_in(self) -> Any:
         node_id = self.search_for_node()
         if is_id_valid(node_id):
-            self.env.process(scale_in_node(self.env, cluster = self, node_id = node_id))
+            scale_in_node(self.env, cluster = self, node_id = node_id)
 
 def is_id_valid(id: int):
     if(id < 0):
@@ -309,8 +309,8 @@ def task(env, cluster: Cluster, service_type: ServiceType):
     yield cluster.nodes[task_node_id].pods[task_pod_id].cpu.put(service_type.value.cpu)
     cluster.nodes[task_node_id].num_tasks -= 1
     cluster.nodes[task_node_id].pods[task_pod_id].num_tasks -= 1
-
     cluster.digest.update(env.now - start)
+    print('a task has finished in time of:', env.now - start)
 
 def wake_pod(cluster: Cluster, node_id, pod_id):
     pod = cluster.nodes[node_id].pods[pod_id]
@@ -398,7 +398,6 @@ def scale_in_node(env, cluster: Cluster, node_id):
     cluster.active_nodes -= 1
 
 def task_generator(env, cluster):
-    yield env.timeout(CLUSTER_CONTROL_TIME + 30)
     print('Task generation has started')
     for i in itertools.count():
         service_type_map = [
@@ -420,6 +419,7 @@ def task_generator(env, cluster):
 
         if (i % 20000 ==0) :
            print('task number:', i, ", time: ", env.now, ', service type is: ', service_type,)
+        #yield env.timeout(CLUSTER_CONTROL_TIME)
 
 class ClusterEnv(ExternalEnv):
     def __init__(self, config: EnvContext):
@@ -432,9 +432,9 @@ class ClusterEnv(ExternalEnv):
 
             Box(0, np.inf, shape=(self.percentile_points,),dtype=np.float64),# response
 
-            Box(0, NODE_RAM, shape=(self.number_of_nodes,),dtype=np.int64),#   ram usage
+            Box(0, NODE_RAM, shape=(self.number_of_nodes,),dtype=np.float64),#   ram usage
 
-            Box(0, np.inf, shape=(self.number_of_nodes,),dtype=np.int64),#     number of tasks on each node
+            Box(0, np.inf, shape=(self.number_of_nodes,),dtype=np.float64),#     number of tasks on each node
           ]
         )
         print("Initialization ---")
@@ -449,6 +449,9 @@ class ClusterEnv(ExternalEnv):
         self.loop = 0
         self.arr = np.zeros(shape=(self.percentile_points,))
         self.ser = np.zeros(shape=(self.percentile_points,))
+        self.nodes_ram_usage = np.zeros(shape=(self.number_of_nodes,))
+        self.nodes_task_number = np.zeros(shape=(self.number_of_nodes,))
+        
 
     def scale_down_pods(self, node: Node, service_type: ServiceType):
         chosen_pod_id = node.oldest_pod_search(service_type)
@@ -497,29 +500,31 @@ class ClusterEnv(ExternalEnv):
         return 100, 100, 100, {}
 
     def digestor(self):
+        self.cluster.digest.update(0.)
+        self.cluster.arrdigest.update(0.)
         for i in range(self.percentile_points):
-            if len(self.cluster.digest.n) == 0:
+            if self.cluster.digest.n == 0:
                 self.arr[i] = 0
                 self.ser[i] = 0
-                print('arr, serr got 0 values')
+                print('arr, serr got 0 datapoints')
             else:
-                self.arr[i] = self.cluster.arrdigest.percentile(i)
-                self.ser[i] = self.cluster.digest.percentile(i)
+                self.arr[i] = max(0.0, self.cluster.arrdigest.percentile(i))
+                self.ser[i] = max(0.0, self.cluster.digest.percentile(i))
 
     def cluster_control(self):
-        print('Cluster control has started')
+        self.cluster.digest = TDigest()
+        self.cluster.arrdigest = TDigest()
+        print('Cluster control has started, TDigest reset')
         yield self.k8env.process(self.cluster.start_nodes(4))
 
         yield self.k8env.timeout(CLUSTER_CONTROL_TIME)
+        print('digestor 1st run')
         self.digestor()
-
-
-        nodes_ram_usage = []
-        nodes_task_num = []
+        
         for node in self.cluster.nodes:
-            nodes_ram_usage.append(node.ram.capacity - node.ram.level)
-            nodes_task_num.append(node.num_tasks)
-        obs = tuple([self.arr, self.ser, nodes_ram_usage, nodes_task_num])
+            self.nodes_ram_usage[node.id] = node.ram.capacity - node.ram.level
+            self.nodes_task_number[node.id] = node.num_tasks
+        obs = tuple([self.arr, self.ser, self.nodes_ram_usage, self.nodes_task_number])
 
         while True:
             if(self.loop % 100 == 0) :
@@ -527,6 +532,9 @@ class ClusterEnv(ExternalEnv):
             self.loop +=1
             self.episode_id = self.start_episode()
             self.action = self.action_space.sample()
+            
+            print('digestor run: ', self.loop, 'th')
+            self.digestor()
 
             if(self.action == Action.ScaleOut and self.cluster.active_nodes == self.cluster.number_of_nodes):
                 self.action = Action.Do_nothing
@@ -534,24 +542,22 @@ class ClusterEnv(ExternalEnv):
             elif self.action == Action.ScaleOut:
                 yield self.k8env.process(self.cluster.scale_out())
             elif self.action == Action.ScaleIn:
-                self.k8env.process(self.cluster.scale_in())
+                self.cluster.scale_in()
 
             self.log_action(self.episode_id, obs, self.action)
 
-            del self.cluster.digest
-            self.cluster.digest = TDigest()
-            del self.cluster.arrdigest
-            self.cluster.arrdigest = TDigest()
+            #del self.cluster.digest
+            #self.cluster.digest = TDigest()
+            #del self.cluster.arrdigest
+            #self.cluster.arrdigest = TDigest()
 
             yield self.k8env.timeout(CLUSTER_CONTROL_TIME)
 
-            self.digestor()
-
             for node in self.cluster.nodes:
-                nodes_ram_usage[node.id] = node.ram.level
-                nodes_task_num[node.id] = node.num_tasks
+                self.nodes_ram_usage[node.id] = node.ram.capacity - node.ram.level
+                self.nodes_task_number[node.id] = node.num_tasks
 
-            obs = tuple([self.arr, self.ser, nodes_ram_usage, nodes_task_num])
+            obs = tuple([self.arr, self.ser, self.nodes_ram_usage, self.nodes_task_number])
             excess_time = RESPONSE_TIME_THRESHOLD_U - self.cluster.digest.percentile(99.9)
             if (self.cluster.digest.percentile(99.9) >
                     RESPONSE_TIME_THRESHOLD_U):
@@ -624,3 +630,4 @@ if __name__ == "__main__":
     #checkpoint = dqn.save()
     #print("Checkpoint saved at", checkpoint)
     ray.shutdown()
+
