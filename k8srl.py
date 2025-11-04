@@ -1,6 +1,5 @@
 import argparse
 import os
-from re import S
 import ray
 import math
 from ray.rllib.env.env_context import EnvContext
@@ -285,7 +284,7 @@ def task(env, cluster: Cluster, service_type: ServiceType):
     task_pod_id = -1
     retry = 0
     while(not is_id_valid(task_pod_id)):
-        if(retry % 10 == 0):
+        if(retry % 10 == 3):
             print('task retried pod search:', retry, 'times, service type is:', service_type)
             if(retry == 100):
                 return
@@ -486,6 +485,7 @@ class ClusterEnv(ExternalEnv):
 
                         elif len(node.pods) < desired_pods:
                             yield self.k8env.process(self.scale_up_pods(node, service_type))
+                        yield self.k8env.timeout(1)
 
                 yield self.k8env.timeout(1)
         finally:
