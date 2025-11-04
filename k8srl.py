@@ -271,7 +271,7 @@ class Cluster(object):
     def scale_in(self) -> Any:
         node_id = self.search_for_node()
         if is_id_valid(node_id):
-            yield self.env.process(scale_in_node(self.env, cluster = self, node_id = node_id))
+            self.env.process(scale_in_node(self.env, cluster = self, node_id = node_id))
 
 def is_id_valid(id: int):
     if(id < 0):
