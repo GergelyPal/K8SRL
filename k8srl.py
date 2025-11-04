@@ -48,7 +48,7 @@ NODE_RAM = 16000
 NODE_CORE = 8
 POD_USAGE = 90
 
-ARRIVAL_RATE = 20.
+ARRIVAL_RATE = 2.
 SERVICE_RATE = 2.0
 SERVICE_TIME = 1.2
 RESPONSE_TIME_THRESHOLD_D = 1.3
@@ -539,9 +539,8 @@ class ClusterEnv(ExternalEnv):
                 self.arr[i] = self.cluster.arrdigest.percentile(i)
                 self.ser[i] = self.cluster.digest.percentile(i)
             for node in self.cluster.nodes:
-                node_id = node.id
-                nodes_ram_usage[node_id](node.ram.level)
-                nodes_task_num[node_id](node.num_tasks)
+                nodes_ram_usage[node.id] = node.ram.level
+                nodes_task_num[node.id] = node.num_tasks
 
             obs = tuple([self.arr, self.ser, nodes_ram_usage, nodes_task_num])
             excess_time = RESPONSE_TIME_THRESHOLD_U - self.cluster.digest.percentile(99.9)
