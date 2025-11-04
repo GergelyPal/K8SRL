@@ -1,6 +1,6 @@
 import argparse
 import os
-from tkinter import SE
+from re import S
 import ray
 import math
 from ray.rllib.env.env_context import EnvContext
@@ -426,7 +426,7 @@ class ClusterEnv(ExternalEnv):
     def __init__(self, config: EnvContext):
         self.number_of_nodes = config["number_of_nodes"]
         self.percentile_points = config["percentile_points"]
-        self.scale_running = False
+        self.scale_running = {stype: False for stype in ServiceType}
         self.observation_space = Tuple(
           [
             Box(0, np.inf, shape=(self.percentile_points,),dtype=np.float64),# Arrival cdf
@@ -489,7 +489,7 @@ class ClusterEnv(ExternalEnv):
 
                 yield self.k8env.timeout(1)
         finally:
-            self.scale_running = False
+            self.scale_running[service_type] = False
 
 
     def step(self, action):
@@ -561,8 +561,8 @@ class ClusterEnv(ExternalEnv):
     def start_pod_scaler(self, service_type: ServiceType):
         print('Pod scaler has started with ServiceType: ', service_type)
         while True:
-            if not self.scale_running:
-                self.scale_running = True
+            if not self.scale_running[service_type]:
+                self.scale_running[service_type] = True
                 yield self.k8env.process(self.scale_pods_by_usage(service_type))
 
     def run(self):
@@ -571,6 +571,7 @@ class ClusterEnv(ExternalEnv):
 
         self.k8env.process(self.start_pod_scaler(ServiceType.typeA))
         self.k8env.process(self.start_pod_scaler(ServiceType.typeB))
+        print('Starting third service type')
         self.k8env.process(self.start_pod_scaler(ServiceType.typeC))
 
         print("--Starting simulation--")
