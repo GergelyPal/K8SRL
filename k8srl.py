@@ -502,11 +502,11 @@ class ClusterEnv(ExternalEnv):
 
         yield self.k8env.timeout(CLUSTER_CONTROL_TIME)
         for i in range(self.percentile_points):
-            if self.cluster.digest.__sizeof__() == 0:
+            if len(self.cluster.digest) == 0:
                 self.arr[i] = 0
                 self.ser[i] = 0
             else:
-                print('digest size: ', self.cluster.digest.__sizeof__())
+                print('digest size when crashing: ', len(self.cluster.digest))
                 self.arr[i] = self.cluster.arrdigest.percentile(i)
                 self.ser[i] = self.cluster.digest.percentile(i)
 
@@ -530,7 +530,7 @@ class ClusterEnv(ExternalEnv):
             elif self.action == Action.ScaleOut:
                 yield self.k8env.process(self.cluster.scale_out())
             elif self.action == Action.ScaleIn:
-                yield self.k8env.process(self.cluster.scale_in())
+                self.k8env.process(self.cluster.scale_in())
 
             self.log_action(self.episode_id, obs, self.action)
 
