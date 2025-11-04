@@ -1,20 +1,3 @@
-"""
-Groups of servers example
-
-Covers:
-
-- Resources: Resource
-- Resources: Container
-- Waiting for other processes
-
-Scenario:
-  A cluster has a number of hosts. Each host has a number of servers.
-  Customers randomly arrive at the cluster, request one
-  server  and obtain service from that server.
-
-  A cluster control process manages the resource (switch on and off the host).
-
-"""
 import argparse
 import os
 import ray
@@ -223,12 +206,6 @@ class Cluster(object):
 
         self.nodes = [Node(env, node_id=i, power_state=PowerState.OFF) for i in range(NUMBER_OF_NODES)]
 
-        for node in self.nodes:
-            if node.power_state == PowerState.ON:
-                node.pods.append(Pod(env, len(self.nodes), ServiceType.TypeA, PowerState.ON))
-                node.pods.append(Pod(env, len(self.nodes), ServiceType.TypeB, PowerState.ON))
-                node.pods.append(Pod(env, len(self.nodes), ServiceType.TypeC, PowerState.ON))
-
         self.digest = TDigest()     #  response time
         self.arrdigest = TDigest()  #  arrival time
         self.arrdigest.update(100.)
@@ -239,6 +216,11 @@ class Cluster(object):
     def start_nodes(self, amount: int):
         for id in range(amount):
             yield self.env.process(start_off_node(self.env, self, id))
+
+            yield self.env.process(start_off_pod(self.env, self, id, service_type= ServiceType.typeA))
+            yield self.env.process(start_off_pod(self.env, self, id, service_type= ServiceType.typeB))
+            yield self.env.process(start_off_pod(self.env, self, id, service_type= ServiceType.typeC))
+
 
     def search_for_node(self) -> Any:
         lowest_load_node_id = 0
@@ -292,9 +274,15 @@ def is_id_valid(id: int):
 #TODO mindig legyen egy az idle nodeok es podok kozul kikapcoslva a megadott arany
 def task(env, cluster: Cluster, service_type: ServiceType):
     task_pod_id = -1
+    retry = 0
     while(not is_id_valid(task_pod_id)):
+        if(retry % 10 == 0):
+            print('task retryed pod search:', retry, " times" ', service type is: ', service_type,)
+            if(retry == 100):
+                return
         task_node_id = cluster.search_for_node()
         task_pod_id = cluster.nodes[task_node_id].least_used_pod(service_type)
+        retry += 1
 
     yield cluster.nodes[task_node_id].pods[task_pod_id].ram.get(service_type.value.ram)
     yield cluster.nodes[task_node_id].pods[task_pod_id].cpu.get(service_type.value.cpu)
@@ -423,7 +411,7 @@ def task_generator(env, cluster):
         env.process(task(env, cluster, service_type))
 
         if (i % 20000 ==0) :
-           print('task', i, "time --", env.now, 'service type is:', service_type,)
+           print('task number:', i, ", time: ", env.now, ', service type is: ', service_type,)
 
 class ClusterEnv(ExternalEnv):
     def __init__(self, config: EnvContext):
@@ -500,7 +488,7 @@ class ClusterEnv(ExternalEnv):
         return 100, 100, 100, {}
 
     def cluster_control(self):
-        #yield self.k8env.timeout(CONTROL_TIME_INTERVAL)
+        self.cluster.start_nodes(4)
         for i in range(self.percentile_points):
             self.arr[i] = self.cluster.arrdigest.percentile(i)
             self.ser[i] = self.cluster.digest.percentile(i)
@@ -508,7 +496,7 @@ class ClusterEnv(ExternalEnv):
         nodes_ram_usage = []
         nodes_task_num = []
         for node in self.cluster.nodes:
-            nodes_ram_usage.append(node.ram.level)
+            nodes_ram_usage.append(node.ram.capacity - node.ram.level)
             nodes_task_num.append(node.num_tasks)
         obs = tuple([self.arr, self.ser, nodes_ram_usage, nodes_task_num])
 
