@@ -502,8 +502,12 @@ class ClusterEnv(ExternalEnv):
 
         yield self.k8env.timeout(CLUSTER_CONTROL_TIME)
         for i in range(self.percentile_points):
-            self.arr[i] = self.cluster.arrdigest.percentile(i)
-            self.ser[i] = self.cluster.digest.percentile(i)
+            if len(self.cluster.digest) == 0:
+                self.arr[i] = 0
+                self.ser[i] = 0
+            else:
+                self.arr[i] = self.cluster.arrdigest.percentile(i)
+                self.ser[i] = self.cluster.digest.percentile(i)
 
         nodes_ram_usage = []
         nodes_task_num = []
