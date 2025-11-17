@@ -150,7 +150,7 @@ class Node(object):
     def desired_replicas(self, desired_usage, service_type: ServiceType):
         avr_usage = 0
         for pod in self.pods:
-            if pod.service_type == service_type:
+            if pod.service_type == service_type and pod.power_state == PowerState.ON:
                 used_ram = pod.ram.capacity - pod.ram.level
                 ram_usage = used_ram / pod.ram.capacity * 100
                 avr_usage += ram_usage
@@ -162,7 +162,7 @@ class Node(object):
         x = len(self.pods) * (avr_usage / desired_usage)
         return math.ceil(x)
 
-    def idle_pod_search(self) -> Any:       #return priority IDLE > ON > OFF
+    def idle_pod_search(self):       #return priority IDLE > ON > OFF
         pod_id = len(self.pods)
         for pod in self.pods:
             if pod.power_state == PowerState.IDLE:
@@ -173,6 +173,12 @@ class Node(object):
                 pod_id = pod.id
                 break
         return pod_id
+
+    def off_pod_search(self, service_type: ServiceType):
+        for pod in self.pods:
+            if pod.power_state == PowerState.OFF and pod.service_type == service_type:
+                return pod.id
+        return -1
 
     def oldest_pod_search(self, service_type: ServiceType) -> Any:
         pod_id = -1
@@ -355,20 +361,31 @@ def start_off_pod(env, cluster: Cluster, node_id: int, service_type: ServiceType
 
 def make_pod_idle(cluster: Cluster, node_id: int, pod_id:int):
     node = cluster.nodes[node_id]
-    if(node.pods[pod_id].power_state == PowerState.ON):
+    power_state = node.pods[pod_id].power_state
+    if power_state == PowerState.ON:
         node.num_active_pods -= 1
-    if(node.pods[pod_id].power_state != PowerState.IDLE):
+    if power_state != PowerState.IDLE:
         node.pods[pod_id].power_state = PowerState.IDLE
         node.num_idle_pods += 1
 
-def make_node_idle(cluster: Cluster, node_id: int):
+        if power_state == PowerState.OFF:
+            service_type = node.pods[pod_id].service_type
+            yield node.ram.get(service_type.value.ram)
+            yield node.cpu.get(service_type.value.cpu)
+
+
+
+def make_node_idle(env, cluster: Cluster, node_id: int):
     node = cluster.nodes[node_id]
     if(node.power_state != PowerState.IDLE):
         node.power_state = PowerState.IDLE
+        for pod in node.pods:
+            yield env.process(make_pod_idle(cluster = cluster, node_id = node_id, pod_id = pod.id))
 
 
 def new_pod(env, cluster: Cluster, node_id: int, service_type: ServiceType, power_state: PowerState):
-    yield env.timeout(BOOT_TIME_POD)
+    if(power_state != PowerState.OFF):
+        yield env.timeout(BOOT_TIME_POD)
     pod = Pod(env, cluster.nodes[node_id].pod_idc, service_type, power_state)
     cluster.nodes[node_id].pod_idc += 1
     cluster.nodes[node_id].pods.append(pod)
@@ -391,7 +408,7 @@ def terminate_pod(env, cluster: Cluster, node_id, pod_id):
 
 
 def scale_in_node(env, cluster: Cluster, node_id):
-    make_node_idle(cluster, node_id)
+    make_node_idle(env, cluster = cluster, node_id = node_id)
     for pod in cluster.nodes[node_id].pods:
         env.process(terminate_pod(env, cluster, node_id, pod.id))
 
@@ -456,12 +473,12 @@ class ClusterEnv(ExternalEnv):
     def scale_down_pods(self, node: Node, service_type: ServiceType):
         chosen_pod_id = node.oldest_pod_search(service_type)
         if(is_id_valid(chosen_pod_id)):
-            self.k8env.process(terminate_pod(env = self.k8env, cluster = self.cluster, node_id = node.id, pod_id = chosen_pod_id))
+            yield self.process(make_pod_idle(self.cluster, node_id = node.id, pod_id = chosen_pod_id,))
 
         if(node.num_idle_pods > math.ceil(node.num_active_pods * IDLE_ACTIVE_RATIO)):
             pod_id = node.oldest_pod_search(service_type)
             if(is_id_valid(pod_id)):
-                make_pod_idle(self.cluster, node_id = node.id, pod_id = pod_id,)
+                yield self.process(make_pod_idle(self.cluster, node_id = node.id, pod_id = pod_id,))
 
     def scale_up_pods(self, node: Node, service_type: ServiceType):
         idle_pod_id = node.idle_pod_search()
@@ -473,23 +490,32 @@ class ClusterEnv(ExternalEnv):
         else:
             yield self.k8env.process(start_off_pod(self.k8env, node.id, service_type))
 
-        if(node.num_idle_pods < math.ceil(node.num_active_pods * IDLE_ACTIVE_RATIO)):
-            pod = node.idle_pod_search()
-            wake_pod(self.cluster, node.id, pod.id)
+
+    def pod_idle_control(self, node: Node, service_type: ServiceType):
+        if node.num_idle_pods < math.ceil(node.num_active_pods * IDLE_ACTIVE_RATIO):
+            off_pod_id = node.off_pod_search(service_type)
+            if is_id_valid(off_pod_id):
+                yield self.process(make_pod_idle(self.cluster, node.id, off_pod_id))
+            else:
+                new_pod(self, cluster = self.cluster, node_id = node.id, service_type = service_type, power_state = PowerState.IDLE)
+
+        elif node.num_idle_pods > math.ceil(node.num_active_pods * IDLE_ACTIVE_RATIO):
+            #lehet yield kene terminationhoz
+            idle_pod_id = node.idle_pod_search()
+            if is_id_valid(idle_pod_id) and node.pods[idle_pod_id].power_state == PowerState.IDLE:
+                self.k8env.process(terminate_pod(env = self.k8env, cluster = self.cluster, node_id = node.id, pod_id = idle_pod_id))
 
     def scale_pods_by_usage(self, service_type: ServiceType):
         try:
             while True:
                 for node in self.cluster.nodes:
                     desired_pods = node.desired_replicas(POD_USAGE, service_type)
-                    while(desired_pods != len(node.pods)):
-                        if len(node.pods) > desired_pods:
+                    if len(node.pods) > desired_pods:
                             self.scale_down_pods(node, service_type)
+                    elif len(node.pods) < desired_pods:
+                        yield self.k8env.process(self.scale_up_pods(node, service_type))
 
-                        elif len(node.pods) < desired_pods:
-                            yield self.k8env.process(self.scale_up_pods(node, service_type))
-                        yield self.k8env.timeout(1)
-
+                    self.pod_idle_control(node, service_type)
                 yield self.k8env.timeout(1)
         finally:
             self.scale_running[service_type] = False
