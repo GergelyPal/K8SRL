@@ -511,7 +511,7 @@ class ClusterEnv(ExternalEnv):
                 for node in self.cluster.nodes:
                     desired_pods = node.desired_replicas(POD_USAGE, service_type)
                     if len(node.pods) > desired_pods:
-                            self.scale_down_pods(node, service_type)
+                        yield self.scale_down_pods(node, service_type)
                     elif len(node.pods) < desired_pods:
                         yield self.k8env.process(self.scale_up_pods(node, service_type))
 
@@ -609,10 +609,10 @@ class ClusterEnv(ExternalEnv):
         self.k8env.process(self.cluster_control())
         self.k8env.process(task_generator(self.k8env, self.cluster))
 
-        self.k8env.process(self.start_pod_scaler(ServiceType.typeA))
-        self.k8env.process(self.start_pod_scaler(ServiceType.typeB))
+        self.k8env.process(self.scale_pods_by_usage(ServiceType.typeA))
+        self.k8env.process(self.scale_pods_by_usage(ServiceType.typeB))
         print('Starting third service type')
-        self.k8env.process(self.start_pod_scaler(ServiceType.typeC))
+        self.k8env.process(self.scale_pods_by_usage(ServiceType.typeC))
 
         print("--Starting simulation--")
         self.k8env.run(until=SIM_TIME)
