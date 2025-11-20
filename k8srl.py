@@ -147,15 +147,25 @@ class Node(object):
         self.num_tasks = 0
 
     def desired_replicas(self, desired_usage, service_type: ServiceType):
-        avr_usage = 0
+        avr_usage_sum = 0
         for pod in self.pods:
             if pod.service_type == service_type and pod.power_state == PowerState.ON:
                 used_ram = pod.ram.capacity - pod.ram.level
                 ram_usage = used_ram / pod.ram.capacity * 100
-                avr_usage += ram_usage
+                avr_usage_sum += ram_usage
+                
+        if self.num_active_pods[service_type] == 0:
+            avr_usage = 0
         else:
-            avr_usage = avr_usage / (self.num_active_pods[service_type] + 1)
+            avr_usage = avr_usage_sum / (self.num_active_pods[service_type])
         x = self.num_active_pods[service_type] * (avr_usage / desired_usage)
+        
+        #print(f"desired_replicas calCUlated x = {x} while avr_usage={avr_usage} and self.num_active_pods[service_type]={self.num_active_pods[service_type]}")
+        
+        real_active = sum(1 for pod in self.pods if pod.power_state == PowerState.ON and pod.service_type == service_type)
+        if real_active != self.num_active_pods[service_type]:
+            print(f"[SYNC ISSUE] In desired_replicas Active node inconsistency with {service_type}: num_active_pods counter={self.num_active_pods[service_type]}, but real_active={real_active}")
+            
         if x == 0: return 1
         return math.ceil(x)
 
@@ -232,20 +242,32 @@ class Cluster(object):
             yield self.env.process(start_off_pod(self.env, self, id, service_type= ServiceType.typeC))
 
 
-    def search_for_node(self) -> Any:
-        lowest_load_node_id = -1
-        for node_id in range(self.number_of_nodes):
-            if (self.nodes[node_id].power_state == PowerState.ON):
-                lowest_load_node_id = node_id
-                break
-        for node_id in range(self.number_of_nodes):
-            node = self.nodes[node_id]
-            lowest_load_node = self.nodes[lowest_load_node_id]
-            if (node.power_state == PowerState.ON and node.ram.level > lowest_load_node.ram.level):
-                lowest_load_node_id = node_id
-        #if lowest_load_node == 0:
-            #return -1
-        return lowest_load_node_id
+    def search_for_node(self, service_type = None) -> Any:
+        lowest_id = -1
+        lowest_load_node = self.nodes[0]
+        for node in self.nodes:
+            if (node.power_state == PowerState.ON):      
+                if service_type != None and node.num_active_pods[service_type] > 0:
+                    lowest_load_node = node
+                    lowest_id = node.id
+                    break
+                elif service_type != None:
+                    lowest_load_node = node
+                    lowest_id = node.id
+                    break
+                
+        if is_id_valid(lowest_id):
+            for node in self.nodes:
+                if (node.power_state == PowerState.ON and lowest_load_node.ram.level > node.ram.level):
+                    if service_type != None and node.num_active_pods[service_type] > 0:
+                        lowest_load_node = node
+                        lowest_id = node.id
+                    elif service_type != None:
+                        lowest_load_node = node
+                        lowest_id = node.id
+       
+        return lowest_id
+        
 
     def idle_node_search(self) -> Any:          #return priority: IDLE > OFF > ON
         max_node_id = self.number_of_nodes - 1
@@ -271,14 +293,14 @@ class Cluster(object):
                 yield self.env.process(start_off_node(self.env, cluster = self, node_id=node_id))
             elif(node.power_state == PowerState.IDLE):
                 yield self.env.process(wake_node(self.env, cluster = self, node_id = node_id))       
-        print('nodes scaled OUT, active nodes: ', self.active_nodes, 'node id:', node.id)
+        #print('nodes scaled OUT, active nodes: ', self.active_nodes, 'node id:', node.id)
 
 
     def scale_in(self) -> Any:
         node_id = self.search_for_node()
         if is_id_valid(node_id):
             scale_in_node(self.env, cluster = self, node_id = node_id)
-            print('nodes scaled IN, active nodes: ', self.active_nodes, 'node id:', node_id)
+            #print('nodes scaled IN, active nodes: ', self.active_nodes, 'node id:', node_id)
 
 def is_id_valid(id: int):
     if(id < 0):
@@ -292,7 +314,7 @@ def task(env, cluster: Cluster, service_type: ServiceType, task_number):
     retry = 0
     
     while(not is_id_valid(task_pod_id)):
-        task_node_id = cluster.search_for_node()
+        task_node_id = cluster.search_for_node(service_type)
         if(is_id_valid(task_node_id)):
             task_pod_id = cluster.nodes[task_node_id].least_used_pod(service_type)
             
@@ -300,16 +322,41 @@ def task(env, cluster: Cluster, service_type: ServiceType, task_number):
             yield env.timeout(1)
             
         if(retry % 300 == 0 and retry != 0): #retry % 30 == 0
-            print('task', task_number,' retried pod search:', retry, 'search returned node_id: ', task_node_id, ' but task stuck in search loop')
-            print('number of active pods: ', cluster.nodes[task_node_id].num_active_pods[service_type])
+            print('task', task_number,' retried pod search:', retry, 'search returned node_id: ', task_node_id, ' but task stuck in search loop and node powerstate=', cluster.nodes[task_node_id].power_state)
+            print('number of active pods: ', cluster.nodes[task_node_id].num_active_pods[service_type], ' on node:', task_node_id)
             print('compatible pods below-------------')
             for pod in cluster.nodes[task_node_id].pods:
                 if service_type == pod.service_type:
                     print('nodes pod (id,power,service,task_service): ', pod.id, pod.power_state, pod.service_type, service_type,' node powerstate: ', cluster.nodes[task_node_id].power_state)
-            print('tasks node should have been nodes[', task_node_id, '].pods[',task_pod_id)
+                    
+            real_active = sum(1 for pod in cluster.nodes[task_node_id].pods if pod.power_state == PowerState.ON and pod.service_type == service_type)
+            if real_active != cluster.nodes[task_node_id].num_active_pods[service_type]:
+                print(f"[SYNC ISSUE] Node {task_node_id} {service_type}: num_active_pods={cluster.nodes[task_node_id].num_active_pods[service_type]}, real_active={real_active}")
+                
+            real_idle = sum(1 for pod in cluster.nodes[task_node_id].pods if pod.power_state == PowerState.IDLE and pod.service_type == service_type)
+            if real_idle != cluster.nodes[task_node_id].num_idle_pods[service_type]:
+                print(f"[SYNC ISSUE] Node {task_node_id} {service_type}: num_idle_pods={cluster.nodes[task_node_id].num_idle_pods[service_type]}, real_idle={real_idle}")
+                
+            real_off = sum(1 for pod in cluster.nodes[task_node_id].pods if pod.power_state == PowerState.OFF and pod.service_type == service_type)
+            if real_off != len(cluster.nodes[task_node_id].pods) - real_idle - real_active:
+                print('off pod calculation went wrong in task()', real_off)
+            
+            on_nodes_sum = 0
+            idle_nodes_sum = 0
+            off_nodes_sum = 0
+            for node in cluster.nodes:
+                if node.power_state == PowerState.ON:
+                    on_nodes_sum +=1
+                elif node.power_state == PowerState.IDLE:
+                    idle_nodes_sum +=1
+                else:
+                    off_nodes_sum +=1
+            
+            if on_nodes_sum != cluster.active_nodes:
+                print(f"[SYNC ISSUE] Active nodes={on_nodes_sum}, but cluster.active_nodes={cluster.active_nodes} also, Off nodes={off_nodes_sum} Idle nodes={idle_nodes_sum}")
+                
         retry += 1
     pod = cluster.nodes[task_node_id].pods[task_pod_id]
-    #print('task started by generator and survived while loop')
     yield pod.ram.get(service_type.value.ram)
     yield pod.cpu.get(service_type.value.cpu)
     cluster.nodes[task_node_id].num_tasks += 1
@@ -326,8 +373,8 @@ def task(env, cluster: Cluster, service_type: ServiceType, task_number):
     cluster.nodes[task_node_id].num_tasks -= 1
     cluster.nodes[task_node_id].pods[task_pod_id].num_tasks -= 1
     cluster.digest.update(env.now - start)
-    if(task_number %60 == 0 and task_number != 0):
-        print('task ', task_number,'has finished in time of:', env.now - start,'pod ram usage: ', pod.ram.level, 'node id: ', task_node_id)
+    #if(task_number %12000 == 0 and task_number != 0):
+        #print('task ', task_number,'has finished in time of:', env.now - start,'pod ram usage: ', pod.ram.level, 'node id: ', task_node_id)
 
 def wake_pod(cluster: Cluster, node_id, pod_id):
     pod = cluster.nodes[node_id].pods[pod_id]
@@ -335,6 +382,8 @@ def wake_pod(cluster: Cluster, node_id, pod_id):
         pod.power_state = PowerState.ON
         cluster.nodes[node_id].num_active_pods[pod.service_type] += 1
         cluster.nodes[node_id].num_idle_pods[pod.service_type] -= 1
+    else:
+        print('wake pod was called with non idle powerstate, powerstate:', pod.power_state )
 
 def wake_node(env, cluster: Cluster, node_id):
     node = cluster.nodes[node_id]
@@ -368,10 +417,10 @@ def start_off_pod(env, cluster: Cluster, node_id: int, service_type: ServiceType
                 yield node.ram.get(service_type.value.ram)
                 yield node.cpu.get(service_type.value.cpu)
                 pod_started = True
+                node.num_active_pods[service_type] += 1
                 break
         if not pod_started:
             yield env.process(new_pod(env, cluster, node_id, service_type, PowerState.ON))
-        node.num_active_pods[service_type] += 1
 
 def make_pod_idle(cluster: Cluster, node_id: int, pod_id:int):
     node = cluster.nodes[node_id]
@@ -379,62 +428,69 @@ def make_pod_idle(cluster: Cluster, node_id: int, pod_id:int):
     power_state = pod.power_state
     if power_state == PowerState.ON:
         node.num_active_pods[pod.service_type] -= 1
+            
     if power_state != PowerState.IDLE:
-        pod.power_state = PowerState.IDLE
-        node.num_idle_pods[pod.service_type] += 1
-
         if power_state == PowerState.OFF:
             service_type = node.pods[pod_id].service_type
             yield node.ram.get(service_type.value.ram)
             yield node.cpu.get(service_type.value.cpu)
+            
+        pod.power_state = PowerState.IDLE
+        node.num_idle_pods[pod.service_type] += 1
+            
 
 
 
 def make_node_idle(env, cluster: Cluster, node_id: int):
     node = cluster.nodes[node_id]
-    if(node.power_state != PowerState.IDLE):
+    if node.power_state != PowerState.IDLE:
+        if node.power_state == PowerState.ON:
+            cluster.active_nodes -= 1
         node.power_state = PowerState.IDLE
         for pod in node.pods:
             yield env.process(make_pod_idle(cluster = cluster, node_id = node_id, pod_id = pod.id))
 
 
-def new_pod(env, cluster: Cluster, node_id: int, service_type: ServiceType, power_state: PowerState):
-    if(power_state != PowerState.OFF):
-        yield env.timeout(BOOT_TIME_POD)
+def new_pod(env, cluster: Cluster, node_id: int, service_type: ServiceType, power_state: PowerState):   
     pod = Pod(env, cluster.nodes[node_id].pod_idc, service_type, power_state)
     cluster.nodes[node_id].pod_idc += 1
     cluster.nodes[node_id].pods.append(pod)
 
     if(power_state != PowerState.OFF ):
+        yield env.timeout(BOOT_TIME_POD)
         yield cluster.nodes[node_id].ram.get(service_type.value.ram)
         yield cluster.nodes[node_id].cpu.get(service_type.value.cpu)
-    cluster.nodes[node_id].num_active_pods[service_type] +=1
+        
+        if power_state == PowerState.ON:
+            cluster.nodes[node_id].num_active_pods[service_type] +=1
+        elif power_state == PowerState.IDLE:
+            cluster.nodes[node_id].num_idle_pods[service_type] +=1
 
 def terminate_pod(env, cluster: Cluster, node_id, pod_id):
-    node = cluster.nodes[node_id]
-    pod = node.pods[pod_id]
-    service_type = pod.service_type
-    
-    if pod.power_state == PowerState.ON:
-        node.num_active_pods[service_type] -=1
-    if pod.power_state == PowerState.IDLE:
-        node.num_idle_pods[service_type] -=1
-    
-    pod.power_state = PowerState.OFF
-    print('pod', pod.id, ' was just terminated')
-    while pod.num_tasks != 0:
-        yield env.timeout(1)
+        node = cluster.nodes[node_id]
+        pod = node.pods[pod_id]
+        service_type = pod.service_type
+        
+        if pod.power_state != PowerState.OFF:
+            if pod.power_state == PowerState.ON:
+                node.num_active_pods[service_type] -=1
+            if pod.power_state == PowerState.IDLE:
+                node.num_idle_pods[service_type] -=1
+            pod.power_state = PowerState.OFF
+            #print('pod', pod.id, ' was just terminated')
+            while pod.num_tasks != 0:
+                yield env.timeout(1)
+                
+            
 
-    yield node.ram.put(service_type.value.ram)
-    yield node.cpu.put(service_type.value.cpu)
+            yield node.ram.put(service_type.value.ram)
+            yield node.cpu.put(service_type.value.cpu)
 
 
 def scale_in_node(env, cluster: Cluster, node_id):
     make_node_idle(env, cluster = cluster, node_id = node_id)
     for pod in cluster.nodes[node_id].pods:
         env.process(terminate_pod(env, cluster, node_id, pod.id))
-
-    cluster.active_nodes -= 1
 
 def task_generator(env, cluster):
     print('Task generation has started')
@@ -492,13 +548,13 @@ class ClusterEnv(ExternalEnv):
         self.nodes_task_number = np.zeros(shape=(self.number_of_nodes,))
         
 
-    def scale_down_pods(self, node: Node, service_type: ServiceType):
+    def scale_in_pods(self, node: Node, service_type: ServiceType):
         chosen_pod_id = node.oldest_pod_search(service_type)
         if(is_id_valid(chosen_pod_id)):
             yield self.k8env.process(make_pod_idle(self.cluster, node_id = node.id, pod_id = chosen_pod_id,))
         self.k8env.timeout(5)
 
-    def scale_up_pods(self, node: Node, service_type: ServiceType):
+    def scale_out_pods(self, node: Node, service_type: ServiceType):
         idle_pod_id = node.idle_pod_search(service_type)
         #print('idle pod search returned: ', idle_pod_id)
         if is_id_valid(idle_pod_id):
@@ -533,10 +589,10 @@ class ClusterEnv(ExternalEnv):
                     desired_pods = node.desired_replicas(POD_USAGE, service_type)
                     if node.num_active_pods[service_type] > desired_pods:
                         #print('scaling down pods because: node.num_active_pods > desired_pods:',node.num_active_pods[service_type] ,desired_pods)
-                        yield self.k8env.process(self.scale_down_pods(node, service_type))
+                        yield self.k8env.process(self.scale_in_pods(node, service_type))
                     elif node.num_active_pods[service_type] < desired_pods:
                         #print('scaling up pods because: node.num_active_pods < desired_pods:',node.num_active_pods[service_type] ,desired_pods)
-                        yield self.k8env.process(self.scale_up_pods(node, service_type))
+                        yield self.k8env.process(self.scale_out_pods(node, service_type))
 
                     yield self.k8env.process(self.pod_idle_control(node, service_type))
                 yield self.k8env.timeout(10)
@@ -577,19 +633,20 @@ class ClusterEnv(ExternalEnv):
         obs = tuple([self.arr, self.ser, self.nodes_ram_usage, self.nodes_task_number])
 
         while True:
-            if(self.loop % 100 == 0) :
-               print("time", self.k8env.now)
+            #if(self.loop % 100 == 0) :
+              # print("time", self.k8env.now)
+              # print('digestor run: ', self.loop, 'th')
             self.loop +=1
             self.episode_id = self.start_episode()
             self.action = self.action_space.sample()
             
-            print('digestor run: ', self.loop, 'th')
+            
             self.digestor()
 
-            if(self.action == Action.Do_nothing):
-                print('do nothing action')
+            #if(self.action == Action.Do_nothing):
+                #print('do nothing action')
 
-            elif self.action == Action.ScaleOut and self.cluster.active_nodes < self.cluster.number_of_nodes:
+            if self.action == Action.ScaleOut and self.cluster.active_nodes < self.cluster.number_of_nodes:
                 yield self.k8env.process(self.cluster.scale_out())
             elif self.action == Action.ScaleIn and self.cluster.active_nodes > 0:
                 self.cluster.scale_in()
