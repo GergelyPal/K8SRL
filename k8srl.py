@@ -107,9 +107,6 @@ class PowerState(IntEnum):
     ON = 1
     IDLE = 2
 
-#hostokbol lettek a node-ok
-#serverekbol lettek a podok
-
 Resources = namedtuple("Resources", ["ram", "cpu"])
 
 class ServiceType(Enum):
