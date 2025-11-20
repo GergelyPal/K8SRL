@@ -48,11 +48,10 @@ NODE_RAM = 16000
 NODE_CORE = 8
 POD_USAGE = 90
 
-ARRIVAL_RATE = 1.
-SERVICE_RATE = 1.2
+ARRIVAL_RATE = 10.
+SERVICE_RATE = 0.2
 SERVICE_TIME = 1.2
-RESPONSE_TIME_THRESHOLD_D = 1.3
-RESPONSE_TIME_THRESHOLD_U = 4.0
+RESPONSE_TIME_THRESHOLD_U = 5
 
 
 
@@ -107,12 +106,15 @@ class PowerState(IntEnum):
     ON = 1
     IDLE = 2
 
+#hostokbol lettek a node-ok
+#serverekbol lettek a podok
+
 Resources = namedtuple("Resources", ["ram", "cpu"])
 
 class ServiceType(Enum):
-    typeA = Resources(ram = 128, cpu = 0.1)
-    typeB = Resources(ram = 256, cpu = 0.2)
-    typeC = Resources(ram = 512, cpu = 0.4)
+    typeA = Resources(ram = 128., cpu = 0.1)
+    typeB = Resources(ram = 256., cpu = 0.2)
+    typeC = Resources(ram = 512., cpu = 0.4)
 
 class Pod(object):
     def __init__(self, env: Any, pod_id: int, service_type: ServiceType , power_state: PowerState) -> None:
@@ -126,6 +128,9 @@ class Pod(object):
         self.cpu = simpy.Container(self.env, service_type.value.cpu, service_type.value.cpu)
 
         self.num_tasks = 0
+        
+    def print_data(self):
+        print(f"Pod {self.id} {self.service_type} powerstate: {self.power_state} ram capacity: {self.ram.capacity} ram level: {self.ram.level}")
 
 class Node(object):
     def __init__(self, env: Any, node_id: int, power_state: PowerState) -> None:
@@ -142,19 +147,30 @@ class Node(object):
 
         self.pods: List[Pod] = []
         self.num_tasks = 0
-
-    def desired_replicas(self, desired_usage, service_type: ServiceType):
+        
+    def average_usage(self, service_type: ServiceType):
         avr_usage_sum = 0
         for pod in self.pods:
             if pod.service_type == service_type and pod.power_state == PowerState.ON:
                 used_ram = pod.ram.capacity - pod.ram.level
-                ram_usage = used_ram / pod.ram.capacity * 100
+                ram_usage = (used_ram / pod.ram.capacity) * 100
                 avr_usage_sum += ram_usage
                 
         if self.num_active_pods[service_type] == 0:
             avr_usage = 0
         else:
             avr_usage = avr_usage_sum / (self.num_active_pods[service_type])
+            
+        if(False): #avr_usage == 50
+            print(f"usage is 50%!!!!!!!!!!!!!!")
+            for pod in self.pods:
+                if(pod.power_state == PowerState.ON):
+                    pod.print_data()
+            
+        return avr_usage
+
+    def desired_replicas(self, desired_usage, service_type: ServiceType):
+        avr_usage = self.average_usage(service_type)
         x = self.num_active_pods[service_type] * (avr_usage / desired_usage)
         
         #print(f"desired_replicas calCUlated x = {x} while avr_usage={avr_usage} and self.num_active_pods[service_type]={self.num_active_pods[service_type]}")
@@ -162,7 +178,7 @@ class Node(object):
         real_active = sum(1 for pod in self.pods if pod.power_state == PowerState.ON and pod.service_type == service_type)
         if real_active != self.num_active_pods[service_type]:
             print(f"[SYNC ISSUE] In desired_replicas Active node inconsistency with {service_type}: num_active_pods counter={self.num_active_pods[service_type]}, but real_active={real_active}")
-            
+        
         if x == 0: return 1
         return math.ceil(x)
 
@@ -255,7 +271,7 @@ class Cluster(object):
                 
         if is_id_valid(lowest_id):
             for node in self.nodes:
-                if (node.power_state == PowerState.ON and lowest_load_node.ram.level > node.ram.level):
+                if (node.power_state == PowerState.ON and lowest_load_node.average_usage(service_type) > node.average_usage(service_type)):
                     if service_type != None and node.num_active_pods[service_type] > 0:
                         lowest_load_node = node
                         lowest_id = node.id
@@ -298,6 +314,23 @@ class Cluster(object):
         if is_id_valid(node_id):
             scale_in_node(self.env, cluster = self, node_id = node_id)
             #print('nodes scaled IN, active nodes: ', self.active_nodes, 'node id:', node_id)
+            
+    def print_data(self, pod_data = False):
+        print(f"****************** active nodes: {self.active_nodes} ******************")
+        #print(f"this was printed out from task {task_number}, this task is being run on nodes[{task_node_id}].pods[{task_pod_id}]")
+        for node in self.nodes:
+            if node.power_state != PowerState.OFF:
+                print(f"---------- Node: {node.id} with powerstate: {node.power_state}----------")
+                print(f"ram usage for ServiceType A: {node.average_usage(ServiceType.typeA)}%")
+                print(f"ram usage for ServiceType B: {node.average_usage(ServiceType.typeB)}%")
+                print(f"ram usage for ServiceType C: {node.average_usage(ServiceType.typeC)}%")
+                print(f"Tasks running at this moment {node.num_tasks}")
+                
+                if pod_data:
+                    print(f"Pods listed below")
+                    for pod in node.pods:
+                        if(pod.power_state != PowerState.OFF):
+                            print(f"pod id:{pod.id} available ram:{pod.ram.level} {pod.service_type} powerstate:{pod.power_state}")
 
 def is_id_valid(id: int):
     if(id < 0):
@@ -309,6 +342,10 @@ def task(env, cluster: Cluster, service_type: ServiceType, task_number):
     task_pod_id = -1
     task_node_id = -1
     retry = 0
+    x = random.uniform(1, 4)
+    y = random.uniform(10, 20)
+    task_ram = math.ceil(service_type.value.ram / x)
+    task_cpu = service_type.value.cpu / 2
     
     while(not is_id_valid(task_pod_id)):
         task_node_id = cluster.search_for_node(service_type)
@@ -317,7 +354,9 @@ def task(env, cluster: Cluster, service_type: ServiceType, task_number):
             
         if not is_id_valid(task_pod_id):
             yield env.timeout(1)
-            
+        
+        if(retry % 2):
+            print(f"task {task_number} is in loop and has retried {retry}")
         if(retry % 300 == 0 and retry != 0): #retry % 30 == 0
             print('task', task_number,' retried pod search:', retry, 'search returned node_id: ', task_node_id, ' but task stuck in search loop and node powerstate=', cluster.nodes[task_node_id].power_state)
             print('number of active pods: ', cluster.nodes[task_node_id].num_active_pods[service_type], ' on node:', task_node_id)
@@ -354,8 +393,8 @@ def task(env, cluster: Cluster, service_type: ServiceType, task_number):
                 
         retry += 1
     pod = cluster.nodes[task_node_id].pods[task_pod_id]
-    yield pod.ram.get(service_type.value.ram)
-    yield pod.cpu.get(service_type.value.cpu)
+    yield pod.ram.get(task_ram)
+    yield pod.cpu.get(task_cpu)
     cluster.nodes[task_node_id].num_tasks += 1
     cluster.nodes[task_node_id].pods[task_pod_id].num_tasks += 1
 
@@ -365,13 +404,15 @@ def task(env, cluster: Cluster, service_type: ServiceType, task_number):
 
     
     yield env.timeout(t)
-    yield pod.ram.put(service_type.value.ram)
-    yield pod.cpu.put(service_type.value.cpu)
+    yield pod.ram.put(task_ram)
+    yield pod.cpu.put(task_cpu)
     cluster.nodes[task_node_id].num_tasks -= 1
     cluster.nodes[task_node_id].pods[task_pod_id].num_tasks -= 1
     cluster.digest.update(env.now - start)
-    #if(task_number %12000 == 0 and task_number != 0):
-        #print('task ', task_number,'has finished in time of:', env.now - start,'pod ram usage: ', pod.ram.level, 'node id: ', task_node_id)
+    if(task_number % 200000 == 0):
+        print(f"task number {task_number}")
+        cluster.print_data()
+        print('task ', task_number,'has finished in time of:', env.now - start,'pod ram usage: ', pod.ram.level, 'node id: ', task_node_id)
 
 def wake_pod(cluster: Cluster, node_id, pod_id):
     pod = cluster.nodes[node_id].pods[pod_id]
@@ -499,19 +540,14 @@ def task_generator(env, cluster):
         ]
         task_type = i % 3
         service_type = service_type_map[task_type]
-        if env.now < SIM_TIME/2:
-            t = random.expovariate(ARRIVAL_RATE)
-        elif env.now < SIM_TIME*3/4:
-            t = random.expovariate(ARRIVAL_RATE/2)
-        else:
-            t = random.expovariate(ARRIVAL_RATE/4)
+        t = random.expovariate(ARRIVAL_RATE)
+      
         cluster.arrdigest.update(t)
         yield env.timeout(t)
         env.process(task(env, cluster, service_type, i))
 
         #if (i % 30 ==0) :
            #print('task generated with number:', i, ", time: ", env.now, ', service type is: ', service_type,)
-        #yield env.timeout(CLUSTER_CONTROL_TIME)
 
 class ClusterEnv(ExternalEnv):
     def __init__(self, config: EnvContext):
@@ -630,9 +666,11 @@ class ClusterEnv(ExternalEnv):
         obs = tuple([self.arr, self.ser, self.nodes_ram_usage, self.nodes_task_number])
 
         while True:
-            #if(self.loop % 100 == 0) :
-              # print("time", self.k8env.now)
-              # print('digestor run: ', self.loop, 'th')
+        
+            if(self.loop % 100 == 0) :
+                #self.cluster.print_data()
+                print("time", self.k8env.now)
+                print('digestor run: ', self.loop, 'th')
             self.loop +=1
             self.episode_id = self.start_episode()
             self.action = self.action_space.sample()
@@ -665,9 +703,9 @@ class ClusterEnv(ExternalEnv):
             excess_time = RESPONSE_TIME_THRESHOLD_U - self.cluster.digest.percentile(99.9)
             if (self.cluster.digest.percentile(99.9) >
                     RESPONSE_TIME_THRESHOLD_U):
-                reward = -1 * math.log2(abs(excess_time))/2 * (self.action + 1)
+                reward = -1 * math.log2(abs(excess_time))/2 * (1/self.cluster.active_nodes)
             else:
-                reward = excess_time * (self.action + 1) + 2
+                reward = excess_time * (1/self.cluster.active_nodes)
             info = ""
             self.log_returns(self.episode_id, reward, info=info)
             self.end_episode(self.episode_id, obs)
