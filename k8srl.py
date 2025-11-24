@@ -611,7 +611,7 @@ class ClusterEnv(ExternalEnv):
 
             Box(0, NODE_RAM, shape=(self.number_of_nodes,),dtype=np.float64),#   ram usage
 
-            Box(0, np.inf, shape=(self.number_of_nodes,),dtype=np.float64),#     number of tasks on each node
+            Discrete(self.number_of_nodes),#   active nodes
           ]
         )
         print("Initialization ---")
@@ -731,15 +731,9 @@ class ClusterEnv(ExternalEnv):
         for node in self.cluster.nodes:
             self.nodes_ram_usage[node.id] = node.ram.capacity - node.ram.level
             self.nodes_task_number[node.id] = node.num_tasks
-        obs = tuple([self.res, self.tas, self.arr, self.nodes_ram_usage, self.nodes_task_number])
+        obs = tuple([self.res, self.tas, self.arr, self.nodes_ram_usage, self.cluster.active_nodes])
 
         while True:
-        
-            if(self.loop % 100 == 0) :
-                time_elapsed = time.time() - self.time_start
-                print(f"------digestor loop: {self.loop} time: {self.k8env.now} real time elapsed: {time_elapsed}seconds")
-                print(f"number of finished tasks: {self.cluster.finished_tasks} active_nodes: {self.cluster.active_nodes} ")
-                #self.cluster.print_data()
             self.loop +=1
             self.episode_id = self.start_episode()
             self.action = self.action_space.sample()
@@ -757,10 +751,12 @@ class ClusterEnv(ExternalEnv):
 
             self.log_action(self.episode_id, obs, self.action)
 
-            #del self.cluster.digest
-            #self.cluster.digest = TDigest()
-            #del self.cluster.arrdigest
-            #self.cluster.arrdigest = TDigest()
+            del self.cluster.response_digest
+            self.cluster.response_digest = TDigest()
+            del self.cluster.task_length_digest
+            self.cluster.task_length_digest = TDigest()
+            del self.cluster.arr_digest
+            self.cluster.arr_digest = TDigest()
 
             yield self.k8env.timeout(CLUSTER_CONTROL_TIME)
 
@@ -768,20 +764,21 @@ class ClusterEnv(ExternalEnv):
                 self.nodes_ram_usage[node.id] = node.ram.capacity - node.ram.level
                 self.nodes_task_number[node.id] = node.num_tasks
 
-            obs = tuple([self.res, self.tas, self.arr, self.nodes_ram_usage, self.nodes_task_number])
+            obs = tuple([self.res, self.tas, self.arr, self.nodes_ram_usage, self.cluster.active_nodes])
             if self.cluster.active_nodes == 0:
                 reward = -10
             else:
                 reward = self.reward_calculator()
+                
+            if(self.loop % 100 == 0) :
+                time_elapsed = time.time() - self.time_start
+                print(f"------digestor loop: {self.loop} time: {self.k8env.now} real time elapsed: {time_elapsed}seconds")
+                print(f"number of finished tasks: {self.cluster.finished_tasks} active_nodes: {self.cluster.active_nodes} current loop reward: {reward}")
+                #self.cluster.print_data()
             info = ""
             self.log_returns(self.episode_id, reward, info=info)
             self.end_episode(self.episode_id, obs)
-            del self.cluster.response_digest
-            self.cluster.response_digest = TDigest()
-            del self.cluster.task_length_digest
-            self.cluster.task_length_digest = TDigest()
-            del self.cluster.arr_digest
-            self.cluster.arr_digest = TDigest()
+            
             
 
     def start_pod_scaler(self, service_type: ServiceType):
