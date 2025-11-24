@@ -242,10 +242,12 @@ class Cluster(object):
 
         self.nodes = [Node(env, node_id=i, power_state=PowerState.OFF) for i in range(NUMBER_OF_NODES)]
 
-        self.digest = TDigest()     #  response time
-        self.arrdigest = TDigest()  #  arrival time
-        self.arrdigest.update(100.)
-        self.digest.update(0.)
+        self.response_digest = TDigest()     #  response time
+        self.arr_digest = TDigest()  #  wait time between new tasks
+        self.task_length_digest = TDigest()
+        self.arr_digest.update(100.)
+        self.response_digest.update(0.)
+        self.task_length_digest.update(0.)
 
         self.active_nodes = 0
         self.finished_tasks = 0
@@ -420,10 +422,13 @@ def task(env, cluster: Cluster, service_type: ServiceType, task_number):
     yield pod.cpu.put(task_cpu)
     cluster.nodes[task_node_id].num_tasks -= 1
     cluster.nodes[task_node_id].pods[task_pod_id].num_tasks -= 1
-    if task_number % 1000 == 0:
-        cluster.digest.update(env.now - start)
+    cluster.response_digest.update(env.now - start)
+    cluster.task_length_digest.update(t)
+    pod_ram_usage = ((pod.ram.capacity - pod.ram.level) / pod.ram.capacity ) * 100
+    if pod_ram_usage > 100:
+        print(f"[WARNING]: POD {pod.id} on node {task_node.id} exceeded 100%")
     if(task_number % 72115 == 0):
-        print('task ', task_number,'has finished in time of:', env.now - start,'pod ram usage: ', pod.ram.level, '% node id: ', task_node_id)
+        print(f"task {task_number} ahs finished in time of {env.now - start}, pod ram usage: {pod_ram_usage}% node id: {task_node_id}")
     cluster.finished_tasks +=1
 
 def wake_pod(cluster: Cluster, node_id, pod_id):
@@ -569,7 +574,7 @@ def task_generator(env, cluster):
         arrival_rate = calculate_arrival_rate(arrival_rate, variation = 0)
         t = random.expovariate(5)
       
-        cluster.arrdigest.update(t)
+        cluster.arr_digest.update(t)
         yield env.timeout(t)
         env.process(task(env, cluster, service_type, i))
 
@@ -579,15 +584,15 @@ def task_generator(env, cluster):
 def monitor(env, task_gen, cluster_con, a, b, c):
     while True:
         if not task_gen.is_alive:
-            print(f"!!!!!!!!!!!!!!!!!!Task generator ended")
+            print(f"[FATAL ERROR]: Task generator ended")
         if not cluster_con.is_alive:
-            print(f"!!!!!!!!!!!!!!!!!!Cluster control ended")
+            print(f"[FATAL ERROR]: Cluster control ended")
         if not a.is_alive:
-            print(f"!!!!!!!!!!!!!!!!!!Pod scale typeA ended")
+            print(f"[FATAL ERROR]: Pod scale typeA ended")
         if not b.is_alive:
-            print(f"!!!!!!!!!!!!!!!!!!Pod scale typeB ended")
+            print(f"[FATAL ERROR]: Pod scale typeB ended")
         if not c.is_alive:
-            print(f"!!!!!!!!!!!!!!!!!!Pod scale typeC ended")
+            print(f"[FATAL ERROR]: Pod scale typeC ended")
 
         yield env.timeout(100)   # check every 1 time unit
 
@@ -598,9 +603,11 @@ class ClusterEnv(ExternalEnv):
         self.scale_running = {stype: False for stype in ServiceType}
         self.observation_space = Tuple(
           [
-            Box(0, np.inf, shape=(self.percentile_points,),dtype=np.float64),# Arrival cdf
-
             Box(0, np.inf, shape=(self.percentile_points,),dtype=np.float64),# response
+            
+            Box(0, np.inf, shape=(self.percentile_points,),dtype=np.float64), #task length
+
+            Box(0, np.inf, shape=(self.percentile_points,),dtype=np.float64),# arrival
 
             Box(0, NODE_RAM, shape=(self.number_of_nodes,),dtype=np.float64),#   ram usage
 
@@ -617,8 +624,9 @@ class ClusterEnv(ExternalEnv):
         self.k8env = simpy.Environment()
         self.cluster = Cluster(self.k8env, self.number_of_nodes)
         self.loop = 0
+        self.res = np.zeros(shape=(self.percentile_points,))
+        self.tas = np.zeros(shape=(self.percentile_points,))
         self.arr = np.zeros(shape=(self.percentile_points,))
-        self.ser = np.zeros(shape=(self.percentile_points,))
         self.nodes_ram_usage = np.zeros(shape=(self.number_of_nodes,))
         self.nodes_task_number = np.zeros(shape=(self.number_of_nodes,))
         
@@ -691,21 +699,27 @@ class ClusterEnv(ExternalEnv):
         return 100, 100, 100, {}
 
     def digestor(self):
-        self.cluster.digest.update(0.)
-        self.cluster.arrdigest.update(0.)
+        self.cluster.response_digest.update(0.)
+        self.cluster.task_length_digest.update(0.)
+        self.cluster.arr_digest.update(0.)
         for i in range(self.percentile_points):
-            if self.cluster.digest.n == 0:
+            if self.cluster.response_digest.n == 0:
                 self.arr[i] = 0
-                self.ser[i] = 0
+                self.res[i] = 0
                 print('arr, serr got 0 datapoints')
             else:
-                self.arr[i] = max(0.0, self.cluster.arrdigest.percentile(i))
-                self.ser[i] = max(0.0, self.cluster.digest.percentile(i))
+                self.arr[i] = max(0.0, self.cluster.arr_digest.percentile(i))
+                self.tas[i] = max(0.0, self.cluster.task_length_digest.percentile(i))
+                self.res[i] = max(0.0, self.cluster.response_digest.percentile(i))
+                
+
+    def reward_calculator(self):
+        return (self.cluster.task_length_digest.percentile(95.)/ self.cluster.response_digest.percentile(95.)) * (1/self.cluster.active_nodes)
 
     def cluster_control(self):
         self.time_start = time.time()
-        self.cluster.digest = TDigest()
-        self.cluster.arrdigest = TDigest()
+        self.cluster.response_digest = TDigest()
+        self.cluster.arr_digest = TDigest()
         print('Cluster control has started, TDigest reset')
         yield self.k8env.process(self.cluster.start_nodes(4))
         #print(self.cluster.active_nodes)
@@ -717,7 +731,7 @@ class ClusterEnv(ExternalEnv):
         for node in self.cluster.nodes:
             self.nodes_ram_usage[node.id] = node.ram.capacity - node.ram.level
             self.nodes_task_number[node.id] = node.num_tasks
-        obs = tuple([self.arr, self.ser, self.nodes_ram_usage, self.nodes_task_number])
+        obs = tuple([self.res, self.tas, self.arr, self.nodes_ram_usage, self.nodes_task_number])
 
         while True:
         
@@ -754,19 +768,21 @@ class ClusterEnv(ExternalEnv):
                 self.nodes_ram_usage[node.id] = node.ram.capacity - node.ram.level
                 self.nodes_task_number[node.id] = node.num_tasks
 
-            obs = tuple([self.arr, self.ser, self.nodes_ram_usage, self.nodes_task_number])
-            excess_time = RESPONSE_TIME_THRESHOLD_U - self.cluster.digest.percentile(99.9)
+            obs = tuple([self.res, self.tas, self.arr, self.nodes_ram_usage, self.nodes_task_number])
             if self.cluster.active_nodes == 0:
                 reward = -10
             else:
-                reward = self.cluster.digest.percentile(95.) * (1/self.cluster.active_nodes)
+                reward = self.reward_calculator()
             info = ""
             self.log_returns(self.episode_id, reward, info=info)
             self.end_episode(self.episode_id, obs)
-            del self.cluster.digest
-            self.cluster.digest = TDigest()
-            del self.cluster.arrdigest
-            self.cluster.arrdigest = TDigest()
+            del self.cluster.response_digest
+            self.cluster.response_digest = TDigest()
+            del self.cluster.task_length_digest
+            self.cluster.task_length_digest = TDigest()
+            del self.cluster.arr_digest
+            self.cluster.arr_digest = TDigest()
+            
 
     def start_pod_scaler(self, service_type: ServiceType):
         print('Pod scaler has started with ServiceType: ', service_type)
