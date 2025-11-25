@@ -34,9 +34,9 @@ import itertools
 
 RANDOM_SEED = 42
 
-BOOT_TIME_NODE = 20
+BOOT_TIME_NODE = 300
 WAKE_TIME_NODE = 1
-BOOT_TIME_POD = 1
+BOOT_TIME_POD = 40
 
 IDLE_ACTIVE_RATIO = 0.2
 
@@ -45,14 +45,14 @@ NUM_ARRIVALS = 10000
 CLUSTER_CONTROL_TIME = 100
 
 NUMBER_OF_NODES = 15
-NODE_RAM = 16000
+NODE_RAM = 20000
 NODE_CORE = 8
 POD_USAGE = 90
 
-ARRIVAL_RATE = 10.
-SERVICE_RATE = 0.2
-SERVICE_TIME = 1.2
-RESPONSE_TIME_THRESHOLD_U = 5
+ARRIVAL_RATE = 1.
+VARIATION = 0
+
+SERVICE_RATE = 0.05
 
 
 
@@ -173,14 +173,13 @@ class Node(object):
         return avr_usage
 
     def desired_replicas(self, desired_usage, service_type: ServiceType):
+                
         avr_usage = self.average_usage(service_type)
         x = self.num_active_pods[service_type] * (avr_usage / desired_usage)
         
         #print(f"desired_replicas calCUlated x = {x} while avr_usage={avr_usage} and self.num_active_pods[service_type]={self.num_active_pods[service_type]}")
         
-        real_active = sum(1 for pod in self.pods if pod.power_state == PowerState.ON and pod.service_type == service_type)
-        if real_active != self.num_active_pods[service_type]:
-            print(f"[SYNC ISSUE] In desired_replicas Active node inconsistency with {service_type}: num_active_pods counter={self.num_active_pods[service_type]}, but real_active={real_active}")
+        
         
         if x == 0: return 1
         return math.ceil(x)
@@ -222,10 +221,10 @@ class Node(object):
         return pod_id
 
 
-    def least_used_pod(self, service_type: ServiceType) -> Any:
+    def least_used_pod(self, service_type: ServiceType, task_ram) -> Any:
         lowest_load_id = -1
         for pod in self.pods:
-            if (pod.power_state == PowerState.ON and pod.service_type == service_type):
+            if (pod.power_state == PowerState.ON and pod.service_type == service_type): #and pod.ram.level > task_ram
                 lowest_load_id = pod.id
                 break
 
@@ -235,6 +234,12 @@ class Node(object):
                 lowest_load_id = pod.id
         return lowest_load_id
 
+    def pod_sync_timeout(self, service_type):
+            real_active = sum(1 for pod in self.pods if pod.power_state == PowerState.ON and pod.service_type == service_type)
+            while real_active != self.num_active_pods[service_type]:
+                yield self.env.timeout(10)
+                real_active = sum(1 for pod in self.pods if pod.power_state == PowerState.ON and pod.service_type == service_type)
+
 class Cluster(object):
     def __init__(self, env: Any, number_of_nodes: int,) -> None:
         self.env = env
@@ -242,23 +247,29 @@ class Cluster(object):
 
         self.nodes = [Node(env, node_id=i, power_state=PowerState.OFF) for i in range(NUMBER_OF_NODES)]
 
-        self.response_digest = TDigest()     #  response time
-        self.arr_digest = TDigest()  #  wait time between new tasks
-        self.task_length_digest = TDigest()
-        self.arr_digest.update(100.)
-        self.response_digest.update(0.)
-        self.task_length_digest.update(0.)
+        
+        self.excess_time_digest = TDigest()
+        self.excess_time_digest.update(0.)
+        #self.response_digest = TDigest()     #  response time
+        #self.arr_digest = TDigest()  #  wait time between new tasks
+        #self.task_length_digest = TDigest()
+        #self.arr_digest.update(100.)
+        #self.response_digest.update(0.)
+        #self.task_length_digest.update(0.)
 
         self.active_nodes = 0
         self.finished_tasks = 0
 
     def start_nodes(self, amount: int):
+        print(f"node generation started")
         for id in range(amount):
             yield self.env.process(start_off_node(self.env, self, id))
 
-            yield self.env.process(start_off_pod(self.env, self, id, service_type= ServiceType.typeA))
-            yield self.env.process(start_off_pod(self.env, self, id, service_type= ServiceType.typeB))
-            yield self.env.process(start_off_pod(self.env, self, id, service_type= ServiceType.typeC))
+            #yield self.env.process(start_off_pod(self.env, self, id, service_type= ServiceType.typeA))
+            #yield self.env.process(start_off_pod(self.env, self, id, service_type= ServiceType.typeB))
+            #yield self.env.process(start_off_pod(self.env, self, id, service_type= ServiceType.typeC))
+            print(f"node {id} started")
+        print(f"all nodes started")
 
 
     def search_for_node(self, service_type = None) -> Any:
@@ -350,61 +361,53 @@ def is_id_valid(id: int):
     else:
         return True
 
+def print_task_data(cluster: Cluster, service_type: ServiceType, task_number, task_node_id, task_pod_id, retry):
+    real_active = sum(1 for pod in cluster.nodes[task_node_id].pods if pod.power_state == PowerState.ON and pod.service_type == service_type)
+    #if(retry % 2):
+        #print(f"task {task_number} is in loop and has retried {retry}")
+    if(retry % 1000 == 0 and retry != 0): #retry % 30 == 0
+        print('-------------task', task_number,' retried pod search:', retry, 'times, search returned node_id: ', task_node_id, ' pod id:', task_pod_id, ' node powerstate =', cluster.nodes[task_node_id].power_state, 'ram usage: ', cluster.nodes[task_node_id].average_usage(),'%')
+        print('number of active pods: ', cluster.nodes[task_node_id].num_active_pods[service_type], 'real active: ', real_active, ' on node:', task_node_id)
+        print('compatible pods below')
+        for pod in cluster.nodes[task_node_id].pods:
+            if service_type == pod.service_type:
+                print('nodes pod (id,power,service,task_service): ', pod.id, pod.power_state, pod.service_type, service_type,' node powerstate: ', cluster.nodes[task_node_id].power_state)
+
 def task(env, cluster: Cluster, service_type: ServiceType, task_number):
     task_pod_id = -1
     task_node_id = -1
     retry = 0
-    x = random.uniform(1, 4)
+    timeout_length = 50
+    x = random.uniform(1, 2)
     y = random.uniform(10, 20)
-    task_ram = math.ceil(service_type.value.ram / x)
+    task_ram = math.ceil(service_type.value.ram/ x)
     task_cpu = service_type.value.cpu / 2
     
     while(not is_id_valid(task_pod_id)):
         task_node_id = cluster.search_for_node(service_type)
         if(is_id_valid(task_node_id)):
-            task_pod_id = cluster.nodes[task_node_id].least_used_pod(service_type)
+            task_pod_id = cluster.nodes[task_node_id].least_used_pod(service_type, task_ram)
             
-        if not is_id_valid(task_pod_id):
-            yield env.timeout(1)
+        if not is_id_valid(task_pod_id) and retry != 0:
+            yield env.timeout(timeout_length)
         
-        real_active = sum(1 for pod in cluster.nodes[task_node_id].pods if pod.power_state == PowerState.ON and pod.service_type == service_type)
-        #if(retry % 2):
-            #print(f"task {task_number} is in loop and has retried {retry}")
-        if(retry % 300 == 0 and retry != 0): #retry % 30 == 0
-            print('task', task_number,' retried pod search:', retry, 'search returned node_id: ', task_node_id, ' node powerstate =', cluster.nodes[task_node_id].power_state, 'ram usage: ', cluster.nodes[task_node_id].average_usage(),'%')
-            print('number of active pods: ', cluster.nodes[task_node_id].num_active_pods[service_type], 'real active: ', real_active, ' on node:', task_node_id)
-            print('compatible pods below-------------')
-            for pod in cluster.nodes[task_node_id].pods:
-                if service_type == pod.service_type:
-                    print('nodes pod (id,power,service,task_service): ', pod.id, pod.power_state, pod.service_type, service_type,' node powerstate: ', cluster.nodes[task_node_id].power_state)
-                    
+        print_task_data(cluster, service_type, task_number, task_node_id, task_pod_id, retry)
+        
             
-            if real_active != cluster.nodes[task_node_id].num_active_pods[service_type]:
-                print(f"[SYNC ISSUE] Node {task_node_id} {service_type}: num_active_pods={cluster.nodes[task_node_id].num_active_pods[service_type]}, real_active={real_active}")
-                
-            real_idle = sum(1 for pod in cluster.nodes[task_node_id].pods if pod.power_state == PowerState.IDLE and pod.service_type == service_type)
-            if real_idle != cluster.nodes[task_node_id].num_idle_pods[service_type]:
-                print(f"[SYNC ISSUE] Node {task_node_id} {service_type}: num_idle_pods={cluster.nodes[task_node_id].num_idle_pods[service_type]}, real_idle={real_idle}")
-                
-            real_off = sum(1 for pod in cluster.nodes[task_node_id].pods if pod.power_state == PowerState.OFF and pod.service_type == service_type)
-            #if real_off != len(cluster.nodes[task_node_id].pods) - real_idle - real_active:
-                #print(f"off pod calculation went wrong in task(). actual off pods:{real_off}, all - idle- active: {len(cluster.nodes[task_node_id].pods) - real_idle - real_active} - {real_idle} - {real_active} = {len(cluster.nodes[task_node_id].pods) - real_idle - real_active}")
-            
-            on_nodes_sum = 0
-            idle_nodes_sum = 0
-            off_nodes_sum = 0
-            for node in cluster.nodes:
-                if node.power_state == PowerState.ON:
-                    on_nodes_sum +=1
-                elif node.power_state == PowerState.IDLE:
-                    idle_nodes_sum +=1
-                else:
-                    off_nodes_sum +=1
-            
-            if on_nodes_sum != cluster.active_nodes:
-                print(f"[SYNC ISSUE] Active nodes={on_nodes_sum}, but cluster.active_nodes={cluster.active_nodes} also, Off nodes={off_nodes_sum} Idle nodes={idle_nodes_sum}")
-    
-                
+        on_nodes_sum = 0
+        idle_nodes_sum = 0
+        off_nodes_sum = 0
+        for node in cluster.nodes:
+            if node.power_state == PowerState.ON:
+                on_nodes_sum +=1
+            elif node.power_state == PowerState.IDLE:
+                idle_nodes_sum +=1
+            else:
+                off_nodes_sum +=1
+        
+        if on_nodes_sum != cluster.active_nodes:
+            print(f"[SYNC ISSUE] Active nodes={on_nodes_sum}, but cluster.active_nodes={cluster.active_nodes} also, Off nodes={off_nodes_sum} Idle nodes={idle_nodes_sum}")
+        
         retry += 1
     pod = cluster.nodes[task_node_id].pods[task_pod_id]
     yield pod.ram.get(task_ram)
@@ -422,14 +425,23 @@ def task(env, cluster: Cluster, service_type: ServiceType, task_number):
     yield pod.cpu.put(task_cpu)
     cluster.nodes[task_node_id].num_tasks -= 1
     cluster.nodes[task_node_id].pods[task_pod_id].num_tasks -= 1
-    cluster.response_digest.update(env.now - start)
-    cluster.task_length_digest.update(t)
+    
+    wait_time = retry * timeout_length
+    wait_time2 = max(env.now - start - t, 0.1)
+    cluster.excess_time_digest.update(wait_time2)
     pod_ram_usage = ((pod.ram.capacity - pod.ram.level) / pod.ram.capacity ) * 100
+    
+    if retry > 150:
+        print(f"task {task_number} finished after retrying {retry} times. It's timeout was: {wait_time2}---------")
+    
     if pod_ram_usage > 100:
         print(f"[WARNING]: POD {pod.id} on node {task_node.id} exceeded 100%")
-    if(task_number % 72115 == 0):
-        print(f"task {task_number} ahs finished in time of {env.now - start}, pod ram usage: {pod_ram_usage}% node id: {task_node_id}")
+    if(task_number == -1):
+        print(f"task {task_number} has finished in time of {env.now - start}, pod ram usage: {pod_ram_usage}% node id: {task_node_id} node ram usage: {cluster.nodes[task_node_id].average_usage()}%, active nodes: {cluster.active_nodes}")
     cluster.finished_tasks +=1
+    if(task_number == -1):
+        print(f"task {task_number} has finished in time of {env.now - start}, node id: {task_node_id} node ram usage: {cluster.nodes[task_node_id].average_usage(), }%")
+        print(f"pod id {task_pod_id} pod ram usage: {pod_ram_usage}% ")
 
 def wake_pod(cluster: Cluster, node_id, pod_id):
     pod = cluster.nodes[node_id].pods[pod_id]
@@ -558,8 +570,7 @@ def calculate_arrival_rate(arrival_rate, variation: int = 0):
     return arrival_rate
 
 def task_generator(env, cluster):
-    print('Task generation has started')
-    arrival_rate = 5
+    print('Task generation has started') 
     env.timeout(CLUSTER_CONTROL_TIME)
     for i in itertools.count():
         service_type_map = [
@@ -571,16 +582,16 @@ def task_generator(env, cluster):
         service_type = service_type_map[task_type]
         
         
-        arrival_rate = calculate_arrival_rate(arrival_rate, variation = 0)
-        t = random.expovariate(5)
+        arrival_rate = calculate_arrival_rate(ARRIVAL_RATE, VARIATION)
+        t = random.expovariate(arrival_rate)
       
-        cluster.arr_digest.update(t)
+        #cluster.arr_digest.update(t)
         yield env.timeout(t)
         env.process(task(env, cluster, service_type, i))
 
         #if (i % 30 ==0) :
            #print('task generated with number:', i, ", time: ", env.now, ', service type is: ', service_type,)
-           
+
 def monitor(env, task_gen, cluster_con, a, b, c):
     while True:
         if not task_gen.is_alive:
@@ -601,20 +612,23 @@ class ClusterEnv(ExternalEnv):
         self.number_of_nodes = config["number_of_nodes"]
         self.percentile_points = config["percentile_points"]
         self.scale_running = {stype: False for stype in ServiceType}
-        self.observation_space = Tuple(
+        obs_space1 = Tuple(
           [
-            Box(0, np.inf, shape=(self.percentile_points,),dtype=np.float64),# response
+            #Box(0, np.inf, shape=(self.percentile_points,),dtype=np.float64),# response
             
-            Box(0, np.inf, shape=(self.percentile_points,),dtype=np.float64), #task length
+            #Box(0, np.inf, shape=(self.percentile_points,),dtype=np.float64), #task length
 
-            Box(0, np.inf, shape=(self.percentile_points,),dtype=np.float64),# arrival
+            #Box(0, np.inf, shape=(self.percentile_points,),dtype=np.float64),# arrival
+            
+            Box(0, np.inf, shape=(1,),dtype=np.float64),
 
             Box(0, NODE_RAM, shape=(self.number_of_nodes,),dtype=np.float64),#   ram usage
 
-            Discrete(self.number_of_nodes),#   active nodes
+            Discrete(self.number_of_nodes + 1),#   active nodes
           ]
         )
-        print("Initialization ---")
+        obs_space2 = Discrete(self.number_of_nodes + 1)
+        self.observation_space = obs_space1
         self.action_space = Discrete(3)
         env_config = {
             "action_space": self.action_space,
@@ -624,9 +638,11 @@ class ClusterEnv(ExternalEnv):
         self.k8env = simpy.Environment()
         self.cluster = Cluster(self.k8env, self.number_of_nodes)
         self.loop = 0
-        self.res = np.zeros(shape=(self.percentile_points,))
-        self.tas = np.zeros(shape=(self.percentile_points,))
-        self.arr = np.zeros(shape=(self.percentile_points,))
+        
+        self.ext = np.zeros(shape=(self.percentile_points,))
+        #self.res = np.zeros(shape=(self.percentile_points,))
+        #self.tas = np.zeros(shape=(self.percentile_points,))
+        
         self.nodes_ram_usage = np.zeros(shape=(self.number_of_nodes,))
         self.nodes_task_number = np.zeros(shape=(self.number_of_nodes,))
         
@@ -647,7 +663,7 @@ class ClusterEnv(ExternalEnv):
                 #if node.id == 1:
                     #print(f"node {1} woke idle pod {idle_pod_id}")
             if(pod.power_state == PowerState.OFF):
-                yield self.k8env.process(start_off_pod(self.k8env, self.cluster, node.id, service_type, idle_pod_id))
+                yield self.k8env.process(start_off_pod(self.k8env, self.cluster, node.id, service_type, idle_pod_id))            
                 #if node.id == 1:
                     #print(f"Node {node.id} started off pod")
 
@@ -655,7 +671,9 @@ class ClusterEnv(ExternalEnv):
             yield self.k8env.process(start_off_pod(self.k8env, self.cluster, node.id, service_type, idle_pod_id))
             #if node.id == 1:
                 #print(f"Node {node.id} started off pod")
-        self.k8env.timeout(5)  
+        yield self.k8env.timeout(5)  
+        
+    
 
 
     def pod_idle_control(self, node: Node, service_type: ServiceType):
@@ -673,12 +691,15 @@ class ClusterEnv(ExternalEnv):
                 self.k8env.process(terminate_pod(env = self.k8env, cluster = self.cluster, node_id = node.id, pod_id = idle_pod_id))
 
     def scale_pods_by_usage(self, service_type: ServiceType):
+        yield self.k8env.timeout(CLUSTER_CONTROL_TIME*10)
         try:
+            
             while True:
                 for node in self.cluster.nodes:
                     if node.power_state == PowerState.ON:
                         #if node.id == 1:
                             #print(f"node {node.id} scaling pods rn, active pods with type {service_type}:{node.num_active_pods[service_type]}, idle pods:{node.num_idle_pods[service_type]}|||||||||||")
+                        yield self.k8env.process(node.pod_sync_timeout(service_type))
                         desired_pods = node.desired_replicas(POD_USAGE, service_type)
                         
                         if node.num_active_pods[service_type] > desired_pods:
@@ -699,94 +720,111 @@ class ClusterEnv(ExternalEnv):
         return 100, 100, 100, {}
 
     def digestor(self):
-        self.cluster.response_digest.update(0.)
-        self.cluster.task_length_digest.update(0.)
-        self.cluster.arr_digest.update(0.)
+        self.cluster.excess_time_digest.update(0.)
+        #self.cluster.response_digest.update(0.)
+        #self.cluster.task_length_digest.update(0.)
+        #self.cluster.timeout_digest
+        #self.cluster.arr_digest.update(0.)
         for i in range(self.percentile_points):
-            if self.cluster.response_digest.n == 0:
-                self.arr[i] = 0
-                self.res[i] = 0
-                print('arr, serr got 0 datapoints')
+            if self.cluster.excess_time_digest.n == 0:
+                #self.arr[i] = 0
+                self.ext[i] = 0
+                print('ext got 0 datapoints')
             else:
-                self.arr[i] = max(0.0, self.cluster.arr_digest.percentile(i))
-                self.tas[i] = max(0.0, self.cluster.task_length_digest.percentile(i))
-                self.res[i] = max(0.0, self.cluster.response_digest.percentile(i))
+                self.ext[i] = max(0.0, self.cluster.excess_time_digest.percentile(i))
+                #self.arr[i] = max(0.0, self.cluster.arr_digest.percentile(i))
+                #self.tas[i] = max(0.0, self.cluster.task_length_digest.percentile(i))
+                #self.res[i] = max(0.0, self.cluster.response_digest.percentile(i))
                 
 
     def reward_calculator(self):
-        return (self.cluster.task_length_digest.percentile(95.)/ self.cluster.response_digest.percentile(95.)) * (1/self.cluster.active_nodes)
+        excess_time = max(0.001, self.cluster.excess_time_digest.percentile(99.))
+        weighted_node_activity = self.cluster.active_nodes ** 0.5
+        
+        return 1 * 10000 / (excess_time * weighted_node_activity)
+        
+    def observation_calculator(self):
+        arrival_val = calculate_arrival_rate(ARRIVAL_RATE, VARIATION)
+        arrival_array = np.array([arrival_val], dtype=np.float64)
+        
+        obs = tuple([arrival_array, self.nodes_ram_usage, self.cluster.active_nodes]) #self.res, self.arr, self.tas, 
+        obs2 = self.cluster.active_nodes
+        if (isinstance(self.observation_space, Discrete)):
+            return obs2
+        else:
+            return obs
 
     def cluster_control(self):
         self.time_start = time.time()
         self.cluster.response_digest = TDigest()
-        self.cluster.arr_digest = TDigest()
+        #self.cluster.arr_digest = TDigest()
         print('Cluster control has started, TDigest reset')
         yield self.k8env.process(self.cluster.start_nodes(4))
         #print(self.cluster.active_nodes)
-
+        print(f"before cluster control timeout")
         yield self.k8env.timeout(CLUSTER_CONTROL_TIME)
+        print(f"after cluster control timeout")
         print('digestor 1st run')
         self.digestor()
         
         for node in self.cluster.nodes:
             self.nodes_ram_usage[node.id] = node.ram.capacity - node.ram.level
             self.nodes_task_number[node.id] = node.num_tasks
-        obs = tuple([self.res, self.tas, self.arr, self.nodes_ram_usage, self.cluster.active_nodes])
-
-        while True:
-            self.loop +=1
-            self.episode_id = self.start_episode()
-            self.action = self.action_space.sample()
-            
-            
-            self.digestor()
-
-            #if(self.action == Action.Do_nothing):
-                #print('do nothing action')
-
-            if self.action == Action.ScaleOut and self.cluster.active_nodes < self.cluster.number_of_nodes:
-                yield self.k8env.process(self.cluster.scale_out())
-            elif self.action == Action.ScaleIn and self.cluster.active_nodes > 1:
-                yield self.k8env.process(self.cluster.scale_in())
-
-            self.log_action(self.episode_id, obs, self.action)
-
-            del self.cluster.response_digest
-            self.cluster.response_digest = TDigest()
-            del self.cluster.task_length_digest
-            self.cluster.task_length_digest = TDigest()
-            del self.cluster.arr_digest
-            self.cluster.arr_digest = TDigest()
-
-            yield self.k8env.timeout(CLUSTER_CONTROL_TIME)
-
-            for node in self.cluster.nodes:
-                self.nodes_ram_usage[node.id] = node.ram.capacity - node.ram.level
-                self.nodes_task_number[node.id] = node.num_tasks
-
-            obs = tuple([self.res, self.tas, self.arr, self.nodes_ram_usage, self.cluster.active_nodes])
-            if self.cluster.active_nodes == 0:
-                reward = -10
-            else:
-                reward = self.reward_calculator()
+        
+        try:
+            while True:
+                self.loop +=1
+                self.episode_id = self.start_episode()
+                self.action = self.action_space.sample()
                 
-            if(self.loop % 100 == 0) :
-                time_elapsed = time.time() - self.time_start
-                print(f"------digestor loop: {self.loop} time: {self.k8env.now} real time elapsed: {time_elapsed}seconds")
-                print(f"number of finished tasks: {self.cluster.finished_tasks} active_nodes: {self.cluster.active_nodes} current loop reward: {reward}")
-                #self.cluster.print_data()
-            info = ""
-            self.log_returns(self.episode_id, reward, info=info)
-            self.end_episode(self.episode_id, obs)
-            
-            
+                
+                self.digestor()
+                
+                if self.action == Action.ScaleOut and self.cluster.active_nodes < self.cluster.number_of_nodes:
+                    yield self.k8env.process(self.cluster.scale_out())
+                elif self.action == Action.ScaleIn and self.cluster.active_nodes > 1:
+                    yield self.k8env.process(self.cluster.scale_in())
+                  
+                observation = self.observation_calculator()
+                self.log_action(self.episode_id, observation, self.action)
+                
+                del self.cluster.excess_time_digest
+                self.cluster.excess_time_digest = TDigest()
+                
+                #del self.cluster.task_length_digest
+                #self.cluster.task_length_digest = TDigest()
+                
+                #del self.cluster.arr_digest
+                #self.cluster.arr_digest = TDigest()
 
-    def start_pod_scaler(self, service_type: ServiceType):
-        print('Pod scaler has started with ServiceType: ', service_type)
-        while True:
-            if not self.scale_running[service_type]:
-                self.scale_running[service_type] = True
-                yield self.k8env.process(self.scale_pods_by_usage(service_type))
+                yield self.k8env.timeout(CLUSTER_CONTROL_TIME)
+
+                for node in self.cluster.nodes:
+                    self.nodes_ram_usage[node.id] = node.ram.capacity - node.ram.level
+                    self.nodes_task_number[node.id] = node.num_tasks
+
+                observation = self.observation_calculator()
+                if self.cluster.active_nodes == 0:
+                    reward = -10
+                else:
+                    reward = self.reward_calculator()
+                    
+                if(self.loop % 200 == 0) :
+                    excess_time = self.cluster.excess_time_digest.percentile(99.)
+                    time_elapsed = time.time() - self.time_start
+                    print(f"------digestor loop: {self.loop} number of finished tasks: {self.cluster.finished_tasks} time: {self.k8env.now} real time elapsed: {time_elapsed} seconds")
+                    print(f"active_nodes: {self.cluster.active_nodes} excess time was: {excess_time} current loop reward: {reward} \n")
+                    
+                    if(self.loop % 1000 == 0):
+                        print(f"Iteration over, real time elapsed since start: {time_elapsed}seconds")
+                    #self.cluster.print_data()
+                info = ""
+                self.log_returns(self.episode_id, reward, info=info)
+                self.end_episode(self.episode_id, observation)
+                
+        except Exception as e:
+            print("cluster control caught", repr(e))
+            
 
     def run(self):
         cluster_con = self.k8env.process(self.cluster_control())
