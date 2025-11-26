@@ -5,14 +5,12 @@ import math
 from ray.rllib.env.env_context import EnvContext
 #  from ray.rllib.agents.dqn import DQNTrainer
 from ray.rllib.algorithms import dqn
+from ray.rllib.algorithms import ppo
 from ray.rllib.algorithms.dqn import DQNConfig
-#  from ray.rllib.agents.dqn.dqn.DQNTrainer import DQNTrainer
-#  from ray.rllib.agents.pg import PGTrainer
-#  from ray.rllib.evaluation.rollout_worker import RolloutWorker
+from ray.rllib.algorithms.ppo import PPOConfig
 from ray.rllib.env.external_env import ExternalEnv
 from ray.rllib.utils.framework import try_import_tf, try_import_torch
 from ray.rllib.utils.test_utils import check_learning_achieved
-#  from ray.rllib.utils.test_utils import framework_iterator
 from ray.tune.registry import get_trainable_cls
 from ray.tune.logger import pretty_print
 from ray.tune.registry import register_env
@@ -34,9 +32,9 @@ import itertools
 
 RANDOM_SEED = 42
 
-BOOT_TIME_NODE = 300
+BOOT_TIME_NODE = 150
 WAKE_TIME_NODE = 1
-BOOT_TIME_POD = 40
+BOOT_TIME_POD = 50
 
 IDLE_ACTIVE_RATIO = 0.2
 
@@ -44,12 +42,12 @@ SIM_TIME = 110000000            # Simulation time in seconds
 NUM_ARRIVALS = 10000
 CLUSTER_CONTROL_TIME = 100
 
-NUMBER_OF_NODES = 15
-NODE_RAM = 20000
+NUMBER_OF_NODES = 20
+NODE_RAM = 30000
 NODE_CORE = 8
 POD_USAGE = 90
 
-ARRIVAL_RATE = 1.
+ARRIVAL_RATE = 0.5
 VARIATION = 0
 
 SERVICE_RATE = 0.05
@@ -177,10 +175,6 @@ class Node(object):
         avr_usage = self.average_usage(service_type)
         x = self.num_active_pods[service_type] * (avr_usage / desired_usage)
         
-        #print(f"desired_replicas calCUlated x = {x} while avr_usage={avr_usage} and self.num_active_pods[service_type]={self.num_active_pods[service_type]}")
-        
-        
-        
         if x == 0: return 1
         return math.ceil(x)
 
@@ -246,16 +240,12 @@ class Cluster(object):
         self.number_of_nodes = number_of_nodes
 
         self.nodes = [Node(env, node_id=i, power_state=PowerState.OFF) for i in range(NUMBER_OF_NODES)]
+        self.tasks_waiting = 0
 
-        
+        self.reward = 0
         self.excess_time_digest = TDigest()
         self.excess_time_digest.update(0.)
-        #self.response_digest = TDigest()     #  response time
-        #self.arr_digest = TDigest()  #  wait time between new tasks
-        #self.task_length_digest = TDigest()
-        #self.arr_digest.update(100.)
-        #self.response_digest.update(0.)
-        #self.task_length_digest.update(0.)
+        
 
         self.active_nodes = 0
         self.finished_tasks = 0
@@ -377,12 +367,12 @@ def task(env, cluster: Cluster, service_type: ServiceType, task_number):
     task_pod_id = -1
     task_node_id = -1
     retry = 0
-    timeout_length = 50
+    timeout_length = 2
     x = random.uniform(1, 2)
     y = random.uniform(10, 20)
     task_ram = math.ceil(service_type.value.ram/ x)
     task_cpu = service_type.value.cpu / 2
-    
+    start = env.now
     while(not is_id_valid(task_pod_id)):
         task_node_id = cluster.search_for_node(service_type)
         if(is_id_valid(task_node_id)):
@@ -390,6 +380,7 @@ def task(env, cluster: Cluster, service_type: ServiceType, task_number):
             
         if not is_id_valid(task_pod_id) and retry != 0:
             yield env.timeout(timeout_length)
+            timeout_length = timeout_length * 1.1
         
         print_task_data(cluster, service_type, task_number, task_node_id, task_pod_id, retry)
         
@@ -410,12 +401,16 @@ def task(env, cluster: Cluster, service_type: ServiceType, task_number):
         
         retry += 1
     pod = cluster.nodes[task_node_id].pods[task_pod_id]
+    
+    cluster.tasks_waiting +=1 
     yield pod.ram.get(task_ram)
     yield pod.cpu.get(task_cpu)
+    cluster.tasks_waiting -=1 
+
     cluster.nodes[task_node_id].num_tasks += 1
     cluster.nodes[task_node_id].pods[task_pod_id].num_tasks += 1
 
-    start = env.now
+    
     t = random.expovariate(SERVICE_RATE) #???
     #  t=random.uniform(0.01,2)
 
@@ -431,8 +426,11 @@ def task(env, cluster: Cluster, service_type: ServiceType, task_number):
     cluster.excess_time_digest.update(wait_time2)
     pod_ram_usage = ((pod.ram.capacity - pod.ram.level) / pod.ram.capacity ) * 100
     
-    if retry > 150:
-        print(f"task {task_number} finished after retrying {retry} times. It's timeout was: {wait_time2}---------")
+    cluster.reward += 500
+    
+    
+    if task_number % 10000 == 0:
+        print(f"task {task_number} finished. Tasks waiting: {cluster.tasks_waiting}. Active nodes: {cluster.active_nodes} It's timeout was: {wait_time2:.3f}---------")
     
     if pod_ram_usage > 100:
         print(f"[WARNING]: POD {pod.id} on node {task_node.id} exceeded 100%")
@@ -616,13 +614,13 @@ class ClusterEnv(ExternalEnv):
           [
             #Box(0, np.inf, shape=(self.percentile_points,),dtype=np.float64),# response
             
-            #Box(0, np.inf, shape=(self.percentile_points,),dtype=np.float64), #task length
-
-            #Box(0, np.inf, shape=(self.percentile_points,),dtype=np.float64),# arrival
+            Box(0, np.inf, shape=(1,),dtype=np.float64), #arrival rate
+ 
+            #Box(0, NODE_RAM, shape=(self.number_of_nodes,),dtype=np.float64),#   ram usage
             
-            Box(0, np.inf, shape=(1,),dtype=np.float64),
-
-            Box(0, NODE_RAM, shape=(self.number_of_nodes,),dtype=np.float64),#   ram usage
+            Box(0, np.inf, shape=(1,),dtype=np.float64), #task wait time percentile
+            
+            Box(0, np.inf, shape=(1,),dtype=np.float64), #tasks waiting
 
             Discrete(self.number_of_nodes + 1),#   active nodes
           ]
@@ -651,7 +649,7 @@ class ClusterEnv(ExternalEnv):
         chosen_pod_id = node.oldest_pod_search(service_type)
         if(is_id_valid(chosen_pod_id)):
             yield self.k8env.process(make_pod_idle(self.cluster, node_id = node.id, pod_id = chosen_pod_id,))
-        self.k8env.timeout(5)
+        yield self.k8env.timeout(5)
 
     def scale_out_pods(self, node: Node, service_type: ServiceType):
         idle_pod_id = node.idle_pod_search(service_type)
@@ -660,22 +658,13 @@ class ClusterEnv(ExternalEnv):
             
             if(pod.power_state == PowerState.IDLE):
                 wake_pod(self.cluster, node.id, idle_pod_id)
-                #if node.id == 1:
-                    #print(f"node {1} woke idle pod {idle_pod_id}")
             if(pod.power_state == PowerState.OFF):
                 yield self.k8env.process(start_off_pod(self.k8env, self.cluster, node.id, service_type, idle_pod_id))            
-                #if node.id == 1:
-                    #print(f"Node {node.id} started off pod")
 
         elif idle_pod_id == -1:
             yield self.k8env.process(start_off_pod(self.k8env, self.cluster, node.id, service_type, idle_pod_id))
-            #if node.id == 1:
-                #print(f"Node {node.id} started off pod")
         yield self.k8env.timeout(5)  
         
-    
-
-
     def pod_idle_control(self, node: Node, service_type: ServiceType):
         if node.num_idle_pods[service_type] < math.ceil(node.num_active_pods[service_type] * IDLE_ACTIVE_RATIO):
             off_pod_id = node.off_pod_search(service_type)
@@ -721,10 +710,6 @@ class ClusterEnv(ExternalEnv):
 
     def digestor(self):
         self.cluster.excess_time_digest.update(0.)
-        #self.cluster.response_digest.update(0.)
-        #self.cluster.task_length_digest.update(0.)
-        #self.cluster.timeout_digest
-        #self.cluster.arr_digest.update(0.)
         for i in range(self.percentile_points):
             if self.cluster.excess_time_digest.n == 0:
                 #self.arr[i] = 0
@@ -732,22 +717,36 @@ class ClusterEnv(ExternalEnv):
                 print('ext got 0 datapoints')
             else:
                 self.ext[i] = max(0.0, self.cluster.excess_time_digest.percentile(i))
-                #self.arr[i] = max(0.0, self.cluster.arr_digest.percentile(i))
-                #self.tas[i] = max(0.0, self.cluster.task_length_digest.percentile(i))
-                #self.res[i] = max(0.0, self.cluster.response_digest.percentile(i))
                 
 
     def reward_calculator(self):
-        excess_time = max(0.001, self.cluster.excess_time_digest.percentile(99.))
-        weighted_node_activity = self.cluster.active_nodes ** 0.5
+        excess_time = max(0.001, self.cluster.excess_time_digest.percentile(80.))
+        reward = 1 * 1500 / (excess_time) + self.cluster.reward
+        return reward
         
-        return 1 * 10000 / (excess_time * weighted_node_activity)
+    def punishment_calculator(self):
+        punishment = 0
+        multiplier = 2 - 1 * (self.cluster.active_nodes/ NUMBER_OF_NODES) #(NUMBER_OF_NODES / self.cluster.active_nodes)
+        multiplier_task_wait = math.exp(- 0.01 * self.cluster.tasks_waiting)
+        excess_time = max(0.001, self.cluster.excess_time_digest.percentile(80.))
+        #multiplier = 10/self.cluster.active_nodes 
+        
+        if self.action != Action.ScaleOut:
+            punishment = excess_time / 700
+        else:
+            punishment = excess_time / 3500
+        return punishment * multiplier * 10 * multiplier_task_wait
         
     def observation_calculator(self):
         arrival_val = calculate_arrival_rate(ARRIVAL_RATE, VARIATION)
-        arrival_array = np.array([arrival_val], dtype=np.float64)
+        wait_time_percentile = self.cluster.excess_time_digest.percentile(80.)
+        waiting_tasks_val = self.cluster.tasks_waiting
         
-        obs = tuple([arrival_array, self.nodes_ram_usage, self.cluster.active_nodes]) #self.res, self.arr, self.tas, 
+        arrival_array = np.array([arrival_val], dtype=np.float64)
+        wait_time_array = np.array([wait_time_percentile], dtype=np.float64)
+        waiting_tasks_array = np.array([waiting_tasks_val], dtype=np.float64)
+        
+        obs = tuple([arrival_array, wait_time_array, waiting_tasks_array, self.cluster.active_nodes]) #self.res, self.arr, self.tas, , self.nodes_ram_usage
         obs2 = self.cluster.active_nodes
         if (isinstance(self.observation_space, Discrete)):
             return obs2
@@ -767,63 +766,59 @@ class ClusterEnv(ExternalEnv):
         print('digestor 1st run')
         self.digestor()
         
-        for node in self.cluster.nodes:
-            self.nodes_ram_usage[node.id] = node.ram.capacity - node.ram.level
-            self.nodes_task_number[node.id] = node.num_tasks
         
-        try:
-            while True:
-                self.loop +=1
-                self.episode_id = self.start_episode()
-                self.action = self.action_space.sample()
-                
-                
-                self.digestor()
-                
-                if self.action == Action.ScaleOut and self.cluster.active_nodes < self.cluster.number_of_nodes:
-                    yield self.k8env.process(self.cluster.scale_out())
-                elif self.action == Action.ScaleIn and self.cluster.active_nodes > 1:
-                    yield self.k8env.process(self.cluster.scale_in())
-                  
-                observation = self.observation_calculator()
-                self.log_action(self.episode_id, observation, self.action)
-                
-                del self.cluster.excess_time_digest
-                self.cluster.excess_time_digest = TDigest()
-                
-                #del self.cluster.task_length_digest
-                #self.cluster.task_length_digest = TDigest()
-                
-                #del self.cluster.arr_digest
-                #self.cluster.arr_digest = TDigest()
+        
+        #try:
+        while True:
+            self.cluster.reward = 0
+            self.loop +=1
+            self.episode_id = self.start_episode()
+            self.action = self.action_space.sample()
+            
+            for node in self.cluster.nodes:
+                self.nodes_ram_usage[node.id] = node.ram.capacity - node.ram.level
+                self.nodes_task_number[node.id] = node.num_tasks
+            
+            self.digestor()
+            
+            if self.action == Action.ScaleOut and self.cluster.active_nodes < self.cluster.number_of_nodes:
+                yield self.k8env.process(self.cluster.scale_out())
+            elif self.action == Action.ScaleIn and self.cluster.active_nodes > 1:
+                yield self.k8env.process(self.cluster.scale_in())
+ 
+            del self.cluster.excess_time_digest
+            self.cluster.excess_time_digest = TDigest()
+            yield self.k8env.timeout(CLUSTER_CONTROL_TIME)
 
-                yield self.k8env.timeout(CLUSTER_CONTROL_TIME)
+            for node in self.cluster.nodes:
+                self.nodes_ram_usage[node.id] = node.ram.capacity - node.ram.level
+                self.nodes_task_number[node.id] = node.num_tasks
 
-                for node in self.cluster.nodes:
-                    self.nodes_ram_usage[node.id] = node.ram.capacity - node.ram.level
-                    self.nodes_task_number[node.id] = node.num_tasks
-
-                observation = self.observation_calculator()
-                if self.cluster.active_nodes == 0:
-                    reward = -10
-                else:
-                    reward = self.reward_calculator()
-                    
-                if(self.loop % 200 == 0) :
-                    excess_time = self.cluster.excess_time_digest.percentile(99.)
-                    time_elapsed = time.time() - self.time_start
-                    print(f"------digestor loop: {self.loop} number of finished tasks: {self.cluster.finished_tasks} time: {self.k8env.now} real time elapsed: {time_elapsed} seconds")
-                    print(f"active_nodes: {self.cluster.active_nodes} excess time was: {excess_time} current loop reward: {reward} \n")
-                    
-                    if(self.loop % 1000 == 0):
-                        print(f"Iteration over, real time elapsed since start: {time_elapsed}seconds")
-                    #self.cluster.print_data()
-                info = ""
-                self.log_returns(self.episode_id, reward, info=info)
-                self.end_episode(self.episode_id, observation)
+            if self.cluster.active_nodes == 0:
+                reward = -10
+            else:
+                reward = self.reward_calculator()
+                punishment = self.punishment_calculator()
                 
-        except Exception as e:
-            print("cluster control caught", repr(e))
+            
+                
+            if(self.loop % 500 == 0) :
+                excess_time = self.cluster.excess_time_digest.percentile(80.)
+                time_elapsed = time.time() - self.time_start
+                #print(f"------digestor loop: {self.loop} number of finished tasks: {self.cluster.finished_tasks} time: {self.k8env.now} real time elapsed: {time_elapsed} seconds")
+                print(f"--active_nodes: {self.cluster.active_nodes} excess time was: {excess_time} ----- loop reward: {(reward - punishment):.3f} ----- r: {reward:.3f} p: {-punishment:.3f}\n")
+                
+                #self.cluster.print_data()
+            info = ""
+            observation = self.observation_calculator()
+            self.log_action(self.episode_id, observation, self.action)
+            self.log_returns(self.episode_id, reward - punishment, info=info)
+            self.end_episode(self.episode_id, observation)
+            if(self.loop % 1000 == 0) :
+                print(f"Iteration over, time passed: { (time.time() - self.time_start):.3f} seconds")
+            
+        #except Exception as e:
+            #print("cluster control caught", repr(e))
             
 
     def run(self):
@@ -867,13 +862,13 @@ if __name__ == "__main__":
 
     #  for _ in framework_iterator(config, frameworks=("torch")):
     #  dqn = config.build()
-    for i in range(70):
+    for i in range(300):
                 result = dqn.train()
                 print(
-                    "Iteration {}, mean reward {}, timesteps {}".format(
-                        i, result["episode_reward_mean"], result["timesteps_total"]
-                    )
-                ) 
-    #checkpoint = dqn.save()
-    #print("Checkpoint saved at", checkpoint)
+                    f"Iteration {i}, mean reward {result['episode_reward_mean']:.3f}, timesteps {result['timesteps_total']}"
+                )
+                if i % 20 == 0:
+                    checkpoint = dqn.save()
+                    #print("Checkpoint saved at", checkpoint)
+    
     ray.shutdown()
