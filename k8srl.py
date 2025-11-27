@@ -47,7 +47,7 @@ NODE_RAM = 30000
 NODE_CORE = 8
 POD_USAGE = 90
 
-ARRIVAL_RATE = 0.5
+ARRIVAL_RATE = 0.6
 VARIATION = 0
 
 SERVICE_RATE = 0.05
@@ -241,6 +241,7 @@ class Cluster(object):
 
         self.nodes = [Node(env, node_id=i, power_state=PowerState.OFF) for i in range(NUMBER_OF_NODES)]
         self.tasks_waiting = 0
+        self.prev_tasks_waiting = []
 
         self.reward = 0
         self.excess_time_digest = TDigest()
@@ -249,6 +250,13 @@ class Cluster(object):
 
         self.active_nodes = 0
         self.finished_tasks = 0
+        self.arrival_rate = ARRIVAL_RATE
+        
+    def prev_tasks_waiting_mean(self):
+        tasks_sum = 0
+        for number in self.prev_tasks_waiting:
+            tasks_sum += number
+        return tasks_sum / max(len(self.prev_tasks_waiting), 1)
 
     def start_nodes(self, amount: int):
         print(f"node generation started")
@@ -324,6 +332,13 @@ class Cluster(object):
         if is_id_valid(node_id):
             yield self.env.process(scale_in_node(self.env, cluster = self, node_id = node_id))
             #print(f"Nodes scaled in with node id: {node_id} powerstate: {self.nodes[node_id].power_state} active nodes: {self.active_nodes}")
+            
+    def calculate_arrival_rate(self, variation: int = 0):
+        if(variation == 0): #smooth changes around arrival rate
+            self.arrival_rate += random.uniform(-0.2, 0.2)
+            self.arrival_rate = min(max(0.2, self.arrival_rate), 1.2)
+        elif(variation == 1):    #noise around arrival_rate
+            self.arrival_rate = (random.uniform(5,20) + arrival_rate) / 2
             
     def print_data(self, pod_data = False, type_data = False):
         print(f"****************** active nodes: {self.active_nodes} ******************")
@@ -426,11 +441,15 @@ def task(env, cluster: Cluster, service_type: ServiceType, task_number):
     cluster.excess_time_digest.update(wait_time2)
     pod_ram_usage = ((pod.ram.capacity - pod.ram.level) / pod.ram.capacity ) * 100
     
-    cluster.reward += 500
+    cluster.reward += 1000
     
+    if cluster.tasks_waiting <= cluster.prev_tasks_waiting_mean():
+        improvement = "+[IMPROVING]+"      
+    else:
+        improvement = "-[WORSENING]-"
     
     if task_number % 10000 == 0:
-        print(f"task {task_number} finished. Tasks waiting: {cluster.tasks_waiting}. Active nodes: {cluster.active_nodes} It's timeout was: {wait_time2:.3f}---------")
+        print(f"Arrival rate: {cluster.arrival_rate:.3f}, {improvement} Tasks waiting: {cluster.tasks_waiting}, previous 25 mean: {cluster.prev_tasks_waiting_mean()}. Active nodes: {cluster.active_nodes} It's excess time is: {cluster.excess_time_digest.percentile(80):.3f}---------")
     
     if pod_ram_usage > 100:
         print(f"[WARNING]: POD {pod.id} on node {task_node.id} exceeded 100%")
@@ -559,13 +578,7 @@ def scale_in_node(env, cluster: Cluster, node_id):
     for pod in cluster.nodes[node_id].pods:
         env.process(terminate_pod(env, cluster, node_id, pod.id))
 
-def calculate_arrival_rate(arrival_rate, variation: int = 0):
-    if(variation == 0): #smooth changes around arrival rate
-        arrival_rate += random.uniform(-1, 1)
-        arrival_rate = max(1, arrival_rate)
-    elif(variation == 1):    #noise around arrival_rate
-        arrival_rate = (random.uniform(5,20) + arrival_rate) / 2
-    return arrival_rate
+
 
 def task_generator(env, cluster):
     print('Task generation has started') 
@@ -579,9 +592,10 @@ def task_generator(env, cluster):
         task_type = i % 3
         service_type = service_type_map[task_type]
         
-        
-        arrival_rate = calculate_arrival_rate(ARRIVAL_RATE, VARIATION)
-        t = random.expovariate(arrival_rate)
+        if i % 10000 == 0:
+            cluster.calculate_arrival_rate(VARIATION)
+        #cluster.arrival_rate = 0.6
+        t = random.expovariate(cluster.arrival_rate)
       
         #cluster.arr_digest.update(t)
         yield env.timeout(t)
@@ -612,7 +626,7 @@ class ClusterEnv(ExternalEnv):
         self.scale_running = {stype: False for stype in ServiceType}
         obs_space1 = Tuple(
           [
-            #Box(0, np.inf, shape=(self.percentile_points,),dtype=np.float64),# response
+            Discrete(self.number_of_nodes + 1),#   active nodes
             
             Box(0, np.inf, shape=(1,),dtype=np.float64), #arrival rate
  
@@ -621,8 +635,8 @@ class ClusterEnv(ExternalEnv):
             Box(0, np.inf, shape=(1,),dtype=np.float64), #task wait time percentile
             
             Box(0, np.inf, shape=(1,),dtype=np.float64), #tasks waiting
-
-            Discrete(self.number_of_nodes + 1),#   active nodes
+            
+            Box(0, np.inf, shape=(1,),dtype=np.float64), #previous waiting tasks mean
           ]
         )
         obs_space2 = Discrete(self.number_of_nodes + 1)
@@ -721,32 +735,42 @@ class ClusterEnv(ExternalEnv):
 
     def reward_calculator(self):
         excess_time = max(0.001, self.cluster.excess_time_digest.percentile(80.))
-        reward = 1 * 1500 / (excess_time) + self.cluster.reward
+        wait_time_bonus = 150000/ ((excess_time + 1)**0.5)
+        improvement_bonus = max((self.cluster.prev_tasks_waiting_mean() - self.cluster.tasks_waiting) * 500, 20000)
+        
+        reward = wait_time_bonus + self.cluster.reward
         return reward
         
     def punishment_calculator(self):
         punishment = 0
-        multiplier = 2 - 1 * (self.cluster.active_nodes/ NUMBER_OF_NODES) #(NUMBER_OF_NODES / self.cluster.active_nodes)
-        multiplier_task_wait = math.exp(- 0.01 * self.cluster.tasks_waiting)
+        multiplier_node_activity = 2 - 1 * (self.cluster.active_nodes/ NUMBER_OF_NODES) #(NUMBER_OF_NODES / self.cluster.active_nodes)
+        multiplier_task_wait = 2- math.exp(- 0.00001 * self.cluster.tasks_waiting)
         excess_time = max(0.001, self.cluster.excess_time_digest.percentile(80.))
         #multiplier = 10/self.cluster.active_nodes 
+        
+        if self.cluster.tasks_waiting <= self.cluster.prev_tasks_waiting_mean():
+            return 0
         
         if self.action != Action.ScaleOut:
             punishment = excess_time / 700
         else:
             punishment = excess_time / 3500
-        return punishment * multiplier * 10 * multiplier_task_wait
+        punishment = punishment * 300 * multiplier_node_activity * multiplier_task_wait
+        #print(f"Punishment: {punishment:.3f}. Node activity multiplier: { multiplier_node_activity:.3f} task wait multiplier: {multiplier_task_wait:.3f} tasks waiting:{self.cluster.tasks_waiting:.3f}")
+        return punishment
         
     def observation_calculator(self):
-        arrival_val = calculate_arrival_rate(ARRIVAL_RATE, VARIATION)
-        wait_time_percentile = self.cluster.excess_time_digest.percentile(80.)
-        waiting_tasks_val = self.cluster.tasks_waiting
+        cluster = self.cluster
+        wait_time_percentile = cluster.excess_time_digest.percentile(80.)
+        waiting_tasks_val = cluster.tasks_waiting
+        waiting_tasks_mean_val = cluster.prev_tasks_waiting_mean()
         
-        arrival_array = np.array([arrival_val], dtype=np.float64)
+        arrival_array = np.array([cluster.arrival_rate], dtype=np.float64)
         wait_time_array = np.array([wait_time_percentile], dtype=np.float64)
         waiting_tasks_array = np.array([waiting_tasks_val], dtype=np.float64)
+        waiting_tasks_mean_array = np.array([waiting_tasks_val], dtype=np.float64)
         
-        obs = tuple([arrival_array, wait_time_array, waiting_tasks_array, self.cluster.active_nodes]) #self.res, self.arr, self.tas, , self.nodes_ram_usage
+        obs = tuple([ self.cluster.active_nodes, arrival_array, wait_time_array, waiting_tasks_array, waiting_tasks_mean_array]) #self.res, self.arr, self.tas, , self.nodes_ram_usage
         obs2 = self.cluster.active_nodes
         if (isinstance(self.observation_space, Discrete)):
             return obs2
@@ -775,6 +799,9 @@ class ClusterEnv(ExternalEnv):
             self.episode_id = self.start_episode()
             self.action = self.action_space.sample()
             
+            if len(self.cluster.prev_tasks_waiting) > 25:
+                self.cluster.prev_tasks_waiting.pop(0)
+            
             for node in self.cluster.nodes:
                 self.nodes_ram_usage[node.id] = node.ram.capacity - node.ram.level
                 self.nodes_task_number[node.id] = node.num_tasks
@@ -800,15 +827,19 @@ class ClusterEnv(ExternalEnv):
                 reward = self.reward_calculator()
                 punishment = self.punishment_calculator()
                 
+            self.cluster.prev_tasks_waiting.append(self.cluster.tasks_waiting)
             
                 
             if(self.loop % 500 == 0) :
                 excess_time = self.cluster.excess_time_digest.percentile(80.)
                 time_elapsed = time.time() - self.time_start
                 #print(f"------digestor loop: {self.loop} number of finished tasks: {self.cluster.finished_tasks} time: {self.k8env.now} real time elapsed: {time_elapsed} seconds")
-                print(f"--active_nodes: {self.cluster.active_nodes} excess time was: {excess_time} ----- loop reward: {(reward - punishment):.3f} ----- r: {reward:.3f} p: {-punishment:.3f}\n")
+                print(f"t{self.cluster.finished_tasks}--active_nodes: {self.cluster.active_nodes} excess time was: {excess_time} ----- loop reward: {(reward - punishment):.3f} ----- r: {reward:.3f} p: {-punishment:.3f}\n")
+                #arr = [percentile for percentile in self.cluster.excess_time_digest]
+                #print(*arr)
                 
                 #self.cluster.print_data()
+                
             info = ""
             observation = self.observation_calculator()
             self.log_action(self.episode_id, observation, self.action)
@@ -854,7 +885,7 @@ if __name__ == "__main__":
     config = (
             DQNConfig()
             .environment("k8-env")
-            .rollouts(num_rollout_workers=1, enable_connectors=False)
+            .rollouts(num_rollout_workers=6, enable_connectors=False)
     )
     dqn = config.build()
 
